@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
 use log::{debug, info, LevelFilter};
-use sidebundle_closure::{trace::TraceCollector, ClosureBuilder};
+use sidebundle_closure::{trace::TraceCollector, validator::BundleValidator, ClosureBuilder};
 use sidebundle_core::{BundleEntry, BundleSpec, TargetTriple};
 use sidebundle_packager::Packager;
 
@@ -98,6 +98,10 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         spec.target(),
         output.display()
     );
+    BundleValidator::new()
+        .validate(&output, &closure.entry_plans)
+        .context("bundle validation failed")?;
+    info!("linker validation succeeded");
     Ok(())
 }
 
