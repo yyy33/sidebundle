@@ -25,6 +25,9 @@ const DEFAULT_LIBRARY_DIRS: &[&str] = &[
     "/usr/local/lib",
 ];
 
+const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run"];
+const TRACE_SKIP_FILENAMES: &[&str] = &["locale-archive"];
+
 /// Builds dependency closures for host executables.
 #[derive(Default)]
 pub struct ClosureBuilder {
@@ -79,7 +82,12 @@ impl ClosureBuilder {
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
                 match tracer.run(&[entry.path.to_string_lossy().to_string()]) {
-                    Ok(report) => traced_files.extend(report.files),
+                    Ok(report) => traced_files.extend(
+                        report
+                            .files
+                            .into_iter()
+                            .filter(|path| trace_path_allowed(path)),
+                    ),
                     Err(err) => debug!("trace for `{}` failed: {err}", entry.path.display()),
                 }
             }
@@ -307,6 +315,28 @@ fn compute_digest(path: &Path) -> Result<String, ClosureError> {
     Ok(hex)
 }
 
+fn trace_path_allowed(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    for prefix in TRACE_SKIP_PREFIXES {
+        if path.starts_with(Path::new(prefix)) {
+            return false;
+        }
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if TRACE_SKIP_FILENAMES.iter().any(|skip| skip == &name) {
+            return false;
+        }
+    }
+    if let Ok(meta) = fs::metadata(path) {
+        if !meta.is_file() {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug, Error)]
 pub enum ClosureError {
     #[error("failed to read {path}: {source}")]
@@ -349,5 +379,22 @@ mod tests {
                 "entry plan should include launcher info"
             );
         }
+    }
+
+    #[test]
+    fn trace_filter_skips_virtual_fs() {
+        assert!(!trace_path_allowed(Path::new("/proc/self/maps")));
+        assert!(!trace_path_allowed(Path::new("/sys/devices/system/cpu")));
+    }
+
+    #[test]
+    fn trace_filter_skips_locale_archive() {
+        assert!(!trace_path_allowed(Path::new("/usr/lib/locale/locale-archive")));
+    }
+
+    #[test]
+    fn trace_filter_keeps_regular_file() {
+        let path = env::current_dir().unwrap().join("Cargo.toml");
+        assert!(trace_path_allowed(&path));
     }
 }
