@@ -6,7 +6,7 @@ use log::info;
 use sidebundle_core::{BundleSpec, DependencyClosure, EntryBundlePlan};
 use thiserror::Error;
 
-/// 负责把闭包内容写入输出目录并生成 launcher。
+/// Writes the dependency closure to disk and generates launchers.
 #[derive(Debug, Clone)]
 pub struct Packager {
     output_root: PathBuf,
@@ -163,7 +163,9 @@ pub enum PackagerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sidebundle_core::{BundleEntry, BundleSpec, DependencyClosure, EntryBundlePlan, TargetTriple};
+    use sidebundle_core::{
+        BundleEntry, BundleSpec, DependencyClosure, EntryBundlePlan, TargetTriple,
+    };
 
     #[test]
     fn empty_closure_rejected() {

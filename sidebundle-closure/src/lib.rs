@@ -1,9 +1,11 @@
+mod linker;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use log::debug;
+use linker::{LibraryResolution, LinkerError, LinkerRunner};
 use sidebundle_core::{
     parse_elf_metadata, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata, ElfParseError,
     EntryBundlePlan, ResolvedFile,
@@ -24,6 +26,7 @@ const DEFAULT_LIBRARY_DIRS: &[&str] = &[
 pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
     default_paths: Vec<PathBuf>,
+    runner: LinkerRunner,
 }
 
 impl ClosureBuilder {
@@ -37,6 +40,7 @@ impl ClosureBuilder {
                 .iter()
                 .map(|dir| PathBuf::from(dir))
                 .collect(),
+            runner: LinkerRunner::new(),
         }
     }
 
@@ -56,7 +60,10 @@ impl ClosureBuilder {
 
         let files = file_map
             .into_iter()
-            .map(|(source, destination)| ResolvedFile { source, destination })
+            .map(|(source, destination)| ResolvedFile {
+                source,
+                destination,
+            })
             .collect();
 
         Ok(DependencyClosure { files, entry_plans })
@@ -72,12 +79,13 @@ impl ClosureBuilder {
         let entry_metadata = self.load_metadata(&entry_source, cache)?;
         let entry_dest = ensure_file(files, &entry_source);
 
-        let interpreter_path = entry_metadata
-            .interpreter
-            .clone()
-            .ok_or_else(|| ClosureError::MissingInterpreter {
-                path: entry_source.clone(),
-            })?;
+        let interpreter_path =
+            entry_metadata
+                .interpreter
+                .clone()
+                .ok_or_else(|| ClosureError::MissingInterpreter {
+                    path: entry_source.clone(),
+                })?;
         let interpreter_source = canonicalize(&interpreter_path)?;
         let interpreter_dest = ensure_file(files, &interpreter_source);
 
@@ -97,20 +105,15 @@ impl ClosureBuilder {
 
             let metadata = self.load_metadata(&current, cache)?;
             let search_paths = self.compute_search_paths(&current, &metadata);
+            let resolved =
+                self.trace_with_linker(&interpreter_source, &current, &search_paths, metadata)?;
 
-            for lib_name in metadata.needed.iter() {
-                if Self::should_skip(lib_name) {
+            for resolution in resolved {
+                if Self::should_skip(&resolution.name) {
                     continue;
                 }
 
-                let lib_path = self
-                    .locate_library(lib_name, &search_paths)
-                    .ok_or_else(|| ClosureError::LibraryNotFound {
-                        name: lib_name.to_string(),
-                        needed_by: current.clone(),
-                    })?;
-
-                let canonical = canonicalize(&lib_path)?;
+                let canonical = canonicalize(&resolution.target)?;
                 let dest = ensure_file(files, &canonical);
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
@@ -165,22 +168,6 @@ impl ClosureBuilder {
         paths
     }
 
-    fn locate_library(&self, name: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
-        let candidate = Path::new(name);
-        if candidate.is_absolute() && candidate.exists() {
-            return Some(candidate.to_path_buf());
-        }
-
-        for dir in search_paths {
-            let path = dir.join(name);
-            if path.exists() {
-                debug!("Located {} at {}", name, path.display());
-                return Some(path);
-            }
-        }
-        None
-    }
-
     fn expand_origin(segment: &str, origin: &Path) -> Option<PathBuf> {
         if segment.trim().is_empty() {
             return None;
@@ -202,6 +189,24 @@ impl ClosureBuilder {
 
     fn should_skip(name: &str) -> bool {
         name.starts_with("linux-vdso") || name.starts_with("ld-linux")
+    }
+
+    fn trace_with_linker(
+        &self,
+        linker: &Path,
+        subject: &Path,
+        search_paths: &[PathBuf],
+        metadata: &ElfMetadata,
+    ) -> Result<Vec<LibraryResolution>, ClosureError> {
+        if metadata.needed.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.runner
+            .trace_dependencies(linker, subject, search_paths)
+            .map_err(|source| ClosureError::LinkerTrace {
+                path: subject.to_path_buf(),
+                source,
+            })
     }
 
     fn split_paths(value: &str) -> Vec<PathBuf> {
@@ -249,14 +254,9 @@ pub enum ClosureError {
         source: ElfParseError,
     },
     #[error("binary {path} lacks PT_INTERP linker")]
-    MissingInterpreter {
-        path: PathBuf,
-    },
-    #[error("failed to locate {name}, required by {needed_by}")]
-    LibraryNotFound {
-        name: String,
-        needed_by: PathBuf,
-    },
+    MissingInterpreter { path: PathBuf },
+    #[error("linker trace failed for {path}: {source}")]
+    LinkerTrace { path: PathBuf, source: LinkerError },
 }
 
 #[cfg(test)]
@@ -276,7 +276,10 @@ mod tests {
                 "expected /bin/ls closure to contain files"
             );
             assert!(
-                closure.entry_plans.iter().any(|plan| plan.display_name == "ls"),
+                closure
+                    .entry_plans
+                    .iter()
+                    .any(|plan| plan.display_name == "ls"),
                 "entry plan should include launcher info"
             );
         }
