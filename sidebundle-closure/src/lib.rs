@@ -44,6 +44,11 @@ impl ClosureBuilder {
         }
     }
 
+    pub fn with_chroot_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.runner = self.runner.clone().with_root(root);
+        self
+    }
+
     pub fn build(&self, spec: &BundleSpec) -> Result<DependencyClosure, ClosureError> {
         if spec.entries().is_empty() {
             return Ok(DependencyClosure::default());
