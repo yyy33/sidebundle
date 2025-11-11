@@ -164,6 +164,7 @@ pub struct EntryBundlePlan {
 pub struct DependencyClosure {
     pub files: Vec<ResolvedFile>,
     pub entry_plans: Vec<EntryBundlePlan>,
+    pub traced_files: Vec<PathBuf>,
 }
 
 impl DependencyClosure {

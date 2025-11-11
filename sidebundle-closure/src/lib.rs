@@ -1,4 +1,5 @@
 mod linker;
+pub mod trace;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
@@ -27,6 +28,7 @@ pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
     default_paths: Vec<PathBuf>,
     runner: LinkerRunner,
+    tracer: Option<trace::TraceCollector>,
 }
 
 impl ClosureBuilder {
@@ -41,11 +43,21 @@ impl ClosureBuilder {
                 .map(|dir| PathBuf::from(dir))
                 .collect(),
             runner: LinkerRunner::new(),
+            tracer: None,
         }
     }
 
     pub fn with_chroot_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.runner = self.runner.clone().with_root(root);
+        let root_buf = root.into();
+        self.runner = self.runner.clone().with_root(&root_buf);
+        if let Some(tracer) = self.tracer.take() {
+            self.tracer = Some(tracer.with_root(&root_buf));
+        }
+        self
+    }
+
+    pub fn with_tracer(mut self, tracer: trace::TraceCollector) -> Self {
+        self.tracer = Some(tracer);
         self
     }
 
@@ -56,11 +68,17 @@ impl ClosureBuilder {
 
         let mut file_map: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
         let mut entry_plans = Vec::new();
+        let mut traced_files = BTreeSet::new();
         let mut elf_cache: HashMap<PathBuf, ElfMetadata> = HashMap::new();
 
         for entry in spec.entries() {
             let plan = self.build_entry(entry, &mut file_map, &mut elf_cache)?;
             entry_plans.push(plan);
+            if let Some(tracer) = &self.tracer {
+                if let Ok(report) = tracer.run(&[entry.path.to_string_lossy().to_string()]) {
+                    traced_files.extend(report.files);
+                }
+            }
         }
 
         let files = file_map
@@ -71,7 +89,11 @@ impl ClosureBuilder {
             })
             .collect();
 
-        Ok(DependencyClosure { files, entry_plans })
+        Ok(DependencyClosure {
+            files,
+            entry_plans,
+            traced_files: traced_files.into_iter().collect(),
+        })
     }
 
     fn build_entry(
