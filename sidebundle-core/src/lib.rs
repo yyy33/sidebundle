@@ -2,6 +2,7 @@ mod elf;
 
 pub use elf::{parse_elf_metadata, ElfMetadata, ElfParseError};
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::path::PathBuf;
@@ -137,13 +138,19 @@ impl BundleSpec {
 pub struct ResolvedFile {
     pub source: PathBuf,
     pub destination: PathBuf,
+    pub digest: String,
 }
 
 impl ResolvedFile {
-    pub fn new(source: impl Into<PathBuf>, destination: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+        digest: impl Into<String>,
+    ) -> Self {
         Self {
             source: source.into(),
             destination: destination.into(),
+            digest: digest.into(),
         }
     }
 }
@@ -177,6 +184,80 @@ impl DependencyClosure {
         self.entry_plans.push(entry);
         self
     }
+
+    pub fn merge(&mut self, other: DependencyClosure) -> MergeReport {
+        let mut by_destination: HashMap<PathBuf, String> = self
+            .files
+            .iter()
+            .map(|file| (file.destination.clone(), file.digest.clone()))
+            .collect();
+        let mut seen_entry_names: HashSet<String> = self
+            .entry_plans
+            .iter()
+            .map(|plan| plan.display_name.clone())
+            .collect();
+        let mut traced_set: HashSet<PathBuf> = self.traced_files.iter().cloned().collect();
+
+        let mut report = MergeReport::default();
+
+        for file in other.files {
+            match by_destination.get(&file.destination) {
+                Some(existing_digest) if existing_digest == &file.digest => {
+                    report.reused_files += 1;
+                }
+                Some(existing_digest) => {
+                    report.conflicts.push(MergeConflict {
+                        destination: file.destination.clone(),
+                        existing_digest: existing_digest.clone(),
+                        incoming_digest: file.digest.clone(),
+                        incoming_source: file.source.clone(),
+                    });
+                    continue;
+                }
+                None => {
+                    by_destination.insert(file.destination.clone(), file.digest.clone());
+                    report.added_files += 1;
+                    self.files.push(file);
+                }
+            }
+        }
+
+        for plan in other.entry_plans {
+            if seen_entry_names.insert(plan.display_name.clone()) {
+                report.added_entries += 1;
+                self.entry_plans.push(plan);
+            } else {
+                report.skipped_entries += 1;
+            }
+        }
+
+        for traced in other.traced_files {
+            if traced_set.insert(traced.clone()) {
+                report.traced_added += 1;
+                self.traced_files.push(traced);
+            }
+        }
+
+        report
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MergeReport {
+    pub added_files: usize,
+    pub reused_files: usize,
+    pub added_entries: usize,
+    pub skipped_entries: usize,
+    pub traced_added: usize,
+    pub conflicts: Vec<MergeConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeConflict {
+    pub destination: PathBuf,
+    pub existing_digest: String,
+    pub incoming_digest: String,
+    pub incoming_source: PathBuf,
 }
 
 #[cfg(test)]
@@ -193,5 +274,61 @@ mod tests {
     fn reject_unknown_target() {
         let err = TargetTriple::from_str("unknown").unwrap_err();
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn merge_deduplicates_files_by_hash() {
+        let mut base = DependencyClosure {
+            files: vec![ResolvedFile::new("/a", "payload/bin/a", "hash-one")],
+            entry_plans: Vec::new(),
+            traced_files: vec![PathBuf::from("/etc/ssl/cert.pem")],
+        };
+
+        let other = DependencyClosure {
+            files: vec![
+                ResolvedFile::new("/a-copy", "payload/bin/a", "hash-one"),
+                ResolvedFile::new("/b", "payload/lib/b", "hash-two"),
+            ],
+            entry_plans: Vec::new(),
+            traced_files: vec![
+                PathBuf::from("/etc/ssl/cert.pem"),
+                PathBuf::from("/tmp/runtime"),
+            ],
+        };
+
+        let report = base.merge(other);
+        assert_eq!(report.added_files, 1);
+        assert_eq!(report.reused_files, 1);
+        assert_eq!(report.traced_added, 1);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(base.files.len(), 2);
+        assert_eq!(base.traced_files.len(), 2);
+    }
+
+    #[test]
+    fn merge_detects_conflicting_destinations() {
+        let mut base = DependencyClosure {
+            files: vec![ResolvedFile::new(
+                "/bin/foo",
+                "payload/bin/foo",
+                "digest-foo",
+            )],
+            entry_plans: Vec::new(),
+            traced_files: Vec::new(),
+        };
+
+        let other = DependencyClosure {
+            files: vec![ResolvedFile::new(
+                "/bin/foo-alt",
+                "payload/bin/foo",
+                "digest-bar",
+            )],
+            entry_plans: Vec::new(),
+            traced_files: Vec::new(),
+        };
+
+        let report = base.merge(other);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(base.files.len(), 1);
     }
 }

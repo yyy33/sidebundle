@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
-use log::{info, LevelFilter};
-use sidebundle_closure::ClosureBuilder;
+use log::{debug, info, LevelFilter};
+use sidebundle_closure::{trace::TraceCollector, ClosureBuilder};
 use sidebundle_core::{BundleEntry, BundleSpec, TargetTriple};
 use sidebundle_packager::Packager;
 
@@ -33,6 +33,8 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         name,
         target,
         out_dir,
+        trace_root,
+        trace_mode,
     } = args;
 
     let target = TargetTriple::parse(&target)
@@ -57,13 +59,31 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         spec.push_entry(BundleEntry::new(path, display));
     }
 
-    let closure = ClosureBuilder::new()
+    let mut builder = ClosureBuilder::new();
+    if let Some(root) = &trace_root {
+        builder = builder.with_chroot_root(root.clone());
+    }
+    if trace_mode != TraceMode::Off {
+        let mut tracer = TraceCollector::new();
+        if let Some(root) = &trace_root {
+            tracer = tracer.with_root(root.clone());
+        }
+        builder = builder.with_tracer(tracer);
+    }
+
+    let closure = builder
         .build(&spec)
         .context("failed to build dependency closure")?;
     info!(
         "dependency closure built with {} files (including entries)",
         closure.files.len()
     );
+    if !closure.traced_files.is_empty() {
+        debug!(
+            "trace collector captured {} runtime file(s)",
+            closure.traced_files.len()
+        );
+    }
     let packager = if let Some(dir) = out_dir {
         Packager::new().with_output_root(dir)
     } else {
@@ -127,6 +147,20 @@ struct CreateArgs {
     /// Output root (defaults to target/bundles)
     #[arg(long = "out-dir", value_name = "DIR")]
     out_dir: Option<PathBuf>,
+
+    /// Optional rootfs for linker/tracer chroot
+    #[arg(long = "trace-root", value_name = "DIR")]
+    trace_root: Option<PathBuf>,
+
+    /// Runtime tracing mode
+    #[arg(long = "trace-mode", value_enum, default_value_t = TraceMode::Auto)]
+    trace_mode: TraceMode,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum TraceMode {
+    Off,
+    Auto,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

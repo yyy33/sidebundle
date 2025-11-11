@@ -4,9 +4,12 @@ pub mod trace;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use linker::{LibraryResolution, LinkerError, LinkerRunner};
+use log::debug;
+use sha2::{Digest, Sha256};
 use sidebundle_core::{
     parse_elf_metadata, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata, ElfParseError,
     EntryBundlePlan, ResolvedFile,
@@ -49,9 +52,9 @@ impl ClosureBuilder {
 
     pub fn with_chroot_root(mut self, root: impl Into<PathBuf>) -> Self {
         let root_buf = root.into();
-        self.runner = self.runner.clone().with_root(&root_buf);
+        self.runner = self.runner.clone().with_root(root_buf.clone());
         if let Some(tracer) = self.tracer.take() {
-            self.tracer = Some(tracer.with_root(&root_buf));
+            self.tracer = Some(tracer.with_root(root_buf.clone()));
         }
         self
     }
@@ -75,19 +78,22 @@ impl ClosureBuilder {
             let plan = self.build_entry(entry, &mut file_map, &mut elf_cache)?;
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
-                if let Ok(report) = tracer.run(&[entry.path.to_string_lossy().to_string()]) {
-                    traced_files.extend(report.files);
+                match tracer.run(&[entry.path.to_string_lossy().to_string()]) {
+                    Ok(report) => traced_files.extend(report.files),
+                    Err(err) => debug!("trace for `{}` failed: {err}", entry.path.display()),
                 }
             }
         }
 
-        let files = file_map
-            .into_iter()
-            .map(|(source, destination)| ResolvedFile {
+        let mut files = Vec::new();
+        for (source, destination) in file_map.into_iter() {
+            let digest = compute_digest(&source)?;
+            files.push(ResolvedFile {
                 source,
                 destination,
-            })
-            .collect();
+                digest,
+            });
+        }
 
         Ok(DependencyClosure {
             files,
@@ -266,6 +272,32 @@ fn ensure_file(mapping: &mut BTreeMap<PathBuf, PathBuf>, source: &Path) -> PathB
     }
     mapping.insert(source.to_path_buf(), dest.clone());
     dest
+}
+
+fn compute_digest(path: &Path) -> Result<String, ClosureError> {
+    let mut file = fs::File::open(path).map_err(|source| ClosureError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| ClosureError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut hex, "{:02x}", byte).expect("write to string");
+    }
+    Ok(hex)
 }
 
 #[derive(Debug, Error)]
