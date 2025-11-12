@@ -1,6 +1,7 @@
 mod linker;
 pub mod trace;
 pub mod validator;
+pub mod image;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
