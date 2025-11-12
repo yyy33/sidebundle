@@ -167,8 +167,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE_ROOT="$(cd "${{SCRIPT_DIR}}/.." && pwd)"
+export SIDEBUNDLE_ROOT="${{BUNDLE_ROOT}}"
+
+fail() {{
+    echo "sidebundle launcher: $1" >&2
+    exit 1
+}}
 
 BINARY="{binary}"
+if [[ ! -x "${{BINARY}}" ]]; then
+    fail "entry binary missing or not executable: ${{BINARY}}"
+fi
 exec "${{BINARY}}" "$@"
 "#,
             binary = binary_ref
@@ -194,10 +203,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE_ROOT="$(cd "${{SCRIPT_DIR}}/.." && pwd)"
+export SIDEBUNDLE_ROOT="${{BUNDLE_ROOT}}"
+
+fail() {{
+    echo "sidebundle launcher: $1" >&2
+    exit 1
+}}
 
 LINKER="{linker}"
 BINARY="{binary}"
 LIB_PATH="{lib_path}"
+
+if [[ ! -x "${{LINKER}}" ]]; then
+    fail "linker missing or not executable: ${{LINKER}}"
+fi
+if [[ ! -x "${{BINARY}}" ]]; then
+    fail "entry binary missing or not executable: ${{BINARY}}"
+fi
+
+IFS=':' read -r -a __libdirs <<< "${{LIB_PATH}}"
+for dir in "${{__libdirs[@]}}"; do
+    if [[ -z "${{dir}}" ]]; then
+        continue
+    fi
+    if [[ ! -d "${{dir}}" ]]; then
+        echo "sidebundle launcher: warning: library directory missing: ${{dir}}" >&2
+    fi
+done
 
 ORIGINAL_LD_LIBRARY_PATH="${{LD_LIBRARY_PATH:-}}"
 if [[ -n "${{ORIGINAL_LD_LIBRARY_PATH}}" ]]; then
@@ -399,5 +431,8 @@ mod tests {
         assert!(content.contains("--library-path"));
         assert!(content.contains("LD_LIBRARY_PATH"));
         assert!(content.contains("unset LD_PRELOAD"));
+        assert!(content.contains("SIDEBUNDLE_ROOT"));
+        assert!(content.contains("sidebundle launcher"));
+        assert!(content.contains("linker missing or not executable"));
     }
 }
