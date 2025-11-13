@@ -30,37 +30,64 @@ impl BundleValidator {
         bundle_root: &Path,
         plans: &[EntryBundlePlan],
     ) -> Result<(), ValidationError> {
+        let report = self.validate_with_report(bundle_root, plans);
+        let failure_count = report.failure_count();
         info!(
-            "validating {} bundle entr{}",
-            plans.len(),
-            if plans.len() == 1 { "y" } else { "ies" }
+            "validated {} bundle entr{} ({} failure{})",
+            report.entries.len(),
+            if report.entries.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            failure_count,
+            if failure_count == 1 { "" } else { "s" }
         );
-        for plan in plans {
-            self.validate_entry(bundle_root, plan)?;
+        if report.all_passed() {
+            Ok(())
+        } else {
+            Err(ValidationError::Failed { report })
         }
-        Ok(())
     }
 
-    fn validate_entry(
+    /// Produce a detailed validation report without short-circuiting on failures.
+    pub fn validate_with_report(
         &self,
         bundle_root: &Path,
-        plan: &EntryBundlePlan,
-    ) -> Result<(), ValidationError> {
+        plans: &[EntryBundlePlan],
+    ) -> ValidationReport {
+        let mut entries = Vec::new();
+        for plan in plans {
+            entries.push(self.inspect_entry(bundle_root, plan));
+        }
+        ValidationReport { entries }
+    }
+
+    fn inspect_entry(&self, bundle_root: &Path, plan: &EntryBundlePlan) -> EntryValidation {
         let binary_path = bundle_root.join(&plan.binary_destination);
+        let mut validation = EntryValidation {
+            display_name: plan.display_name.clone(),
+            binary_path: binary_path.clone(),
+            status: EntryValidationStatus::StaticOk,
+        };
+
         if !binary_path.exists() {
-            return Err(ValidationError::MissingBinary(binary_path));
+            validation.status = EntryValidationStatus::MissingBinary;
+            return validation;
         }
         if !plan.requires_linker {
             debug!(
                 "entry `{}` is static, skipping linker validation",
                 plan.display_name
             );
-            return Ok(());
+            validation.status = EntryValidationStatus::StaticOk;
+            return validation;
         }
 
         let linker_path = bundle_root.join(&plan.linker_destination);
         if !linker_path.exists() {
-            return Err(ValidationError::MissingLinker(linker_path));
+            validation.status = EntryValidationStatus::MissingLinker;
+            return validation;
         }
 
         let search_paths: Vec<PathBuf> = plan
@@ -69,24 +96,137 @@ impl BundleValidator {
             .map(|dir| bundle_root.join(dir))
             .collect();
 
-        self.runner
+        match self
+            .runner
             .trace_dependencies(&linker_path, &binary_path, &search_paths)
-            .map_err(|source| ValidationError::Linker {
-                binary: binary_path,
-                source,
-            })?;
-        Ok(())
+        {
+            Ok(resolved) => {
+                validation.status = EntryValidationStatus::DynamicOk {
+                    resolved: resolved.len(),
+                };
+            }
+            Err(err) => {
+                validation.status = EntryValidationStatus::LinkerError {
+                    error: LinkerFailure::from(err),
+                };
+            }
+        }
+        validation
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
-    #[error("binary missing at {0}")]
-    MissingBinary(PathBuf),
-    #[error("linker missing at {0}")]
-    MissingLinker(PathBuf),
-    #[error("linker validation failed for {binary}: {source}")]
-    Linker { binary: PathBuf, source: LinkerError },
+    #[error("bundle validation failed")]
+    Failed { report: ValidationReport },
+}
+
+impl ValidationError {
+    pub fn report(&self) -> &ValidationReport {
+        match self {
+            ValidationError::Failed { report } => report,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ValidationReport {
+    pub entries: Vec<EntryValidation>,
+}
+
+impl ValidationReport {
+    pub fn all_passed(&self) -> bool {
+        self.entries.iter().all(|entry| entry.status.is_success())
+    }
+
+    pub fn failures(&self) -> impl Iterator<Item = &EntryValidation> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.status.is_success())
+    }
+
+    pub fn failure_count(&self) -> usize {
+        self.failures().count()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EntryValidation {
+    pub display_name: String,
+    pub binary_path: PathBuf,
+    pub status: EntryValidationStatus,
+}
+
+#[derive(Debug, Clone)]
+pub enum EntryValidationStatus {
+    StaticOk,
+    DynamicOk { resolved: usize },
+    MissingBinary,
+    MissingLinker,
+    LinkerError { error: LinkerFailure },
+}
+
+impl EntryValidationStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(
+            self,
+            EntryValidationStatus::StaticOk | EntryValidationStatus::DynamicOk { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkerFailure {
+    Spawn {
+        linker: PathBuf,
+        message: String,
+    },
+    CommandFailed {
+        linker: PathBuf,
+        status: Option<i32>,
+        stderr: String,
+    },
+    LibraryNotFound {
+        name: String,
+        raw: String,
+    },
+    InvalidPath {
+        path: PathBuf,
+    },
+    PathOutsideRoot {
+        path: PathBuf,
+        root: PathBuf,
+    },
+    Other {
+        message: String,
+    },
+}
+
+impl From<LinkerError> for LinkerFailure {
+    fn from(value: LinkerError) -> Self {
+        match value {
+            LinkerError::Spawn { linker, source } => LinkerFailure::Spawn {
+                linker,
+                message: source.to_string(),
+            },
+            LinkerError::CommandFailed {
+                linker,
+                status,
+                stderr,
+            } => LinkerFailure::CommandFailed {
+                linker,
+                status,
+                stderr,
+            },
+            LinkerError::LibraryNotFound { name, raw } => {
+                LinkerFailure::LibraryNotFound { name, raw }
+            }
+            LinkerError::InvalidPath(path) => LinkerFailure::InvalidPath { path },
+            LinkerError::PathOutsideRoot { path, root } => {
+                LinkerFailure::PathOutsideRoot { path, root }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,11 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_binary_is_error() {
+    fn missing_binary_is_reported() {
         let validator = BundleValidator::new();
         let tmp = tempdir().unwrap();
-        let result = validator.validate(tmp.path(), &[dummy_plan(true)]);
-        assert!(matches!(result, Err(ValidationError::MissingBinary(_))));
+        let report = validator.validate_with_report(tmp.path(), &[dummy_plan(true)]);
+        assert!(!report.all_passed());
+        assert!(matches!(
+            report.entries[0].status,
+            EntryValidationStatus::MissingBinary
+        ));
     }
 
     #[test]
@@ -123,6 +267,11 @@ mod tests {
         let binary_path = tmp.path().join(&plan.binary_destination);
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"#!/bin/true\n").unwrap();
-        assert!(validator.validate(tmp.path(), &[plan]).is_ok());
+        let report = validator.validate_with_report(tmp.path(), &[plan]);
+        assert!(report.all_passed());
+        assert!(matches!(
+            report.entries[0].status,
+            EntryValidationStatus::StaticOk
+        ));
     }
 }

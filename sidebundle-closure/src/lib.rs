@@ -1,7 +1,7 @@
+pub mod image;
 mod linker;
 pub mod trace;
 pub mod validator;
-pub mod image;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
@@ -171,12 +171,12 @@ impl ClosureBuilder {
                     continue;
                 }
 
-                    let canonical = canonicalize(&resolution.target, self.chroot_root.as_deref())?;
-                    let dest = ensure_file(files, &canonical);
-                    if let Some(dir) = dest.parent() {
-                        lib_dirs.insert(dir.to_path_buf());
-                    }
-                    queue.push_back(canonical);
+                let canonical = canonicalize(&resolution.target, self.chroot_root.as_deref())?;
+                let dest = ensure_file(files, &canonical);
+                if let Some(dir) = dest.parent() {
+                    lib_dirs.insert(dir.to_path_buf());
+                }
+                queue.push_back(canonical);
             }
         }
 
@@ -435,7 +435,9 @@ mod tests {
 
     #[test]
     fn trace_filter_skips_locale_archive() {
-        assert!(!trace_path_allowed(Path::new("/usr/lib/locale/locale-archive")));
+        assert!(!trace_path_allowed(Path::new(
+            "/usr/lib/locale/locale-archive"
+        )));
     }
 
     #[test]

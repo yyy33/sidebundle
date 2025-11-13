@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -8,7 +9,7 @@ use log::{debug, info, warn, LevelFilter};
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::TraceCollector,
-    validator::BundleValidator,
+    validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ClosureBuilder,
 };
 use sidebundle_core::{BundleEntry, BundleSpec, DependencyClosure, MergeReport, TargetTriple};
@@ -43,6 +44,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         out_dir,
         trace_root,
         trace_mode,
+        strict_validate,
     } = args;
 
     if from_host.is_empty() && from_image.is_empty() {
@@ -100,10 +102,11 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             paths.len(),
             if paths.len() == 1 { "y" } else { "ies" }
         );
-        let image_result =
-            build_image_closure(preference, &reference, &paths, target, trace_mode)
+        let image_result = build_image_closure(preference, &reference, &paths, target, trace_mode)
             .with_context(|| {
-                format!("failed to build closure for image `{reference}` using backend {preference:?}")
+                format!(
+                    "failed to build closure for image `{reference}` using backend {preference:?}"
+                )
             })?;
         log_closure_stats(&format!("image `{reference}`"), &image_result.closure);
         let report = closure.merge(image_result.closure);
@@ -129,9 +132,30 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         spec.target(),
         output.display()
     );
-    BundleValidator::new()
-        .validate(&output, &closure.entry_plans)
-        .context("bundle validation failed")?;
+    let validator = BundleValidator::new();
+    let report = validator.validate_with_report(&output, &closure.entry_plans);
+    log_validation_report(&report);
+    if !report.all_passed() {
+        let mut details = String::new();
+        for entry in report.failures() {
+            let _ = writeln!(
+                &mut details,
+                " - {} => {}",
+                entry.display_name,
+                describe_status(&entry.status)
+            );
+        }
+        if strict_validate {
+            bail!("bundle validation failed:\n{}", details.trim_end());
+        } else {
+            warn!(
+                "validation found {} entr{} with issues; rerun with --strict-validate to fail build",
+                report.failure_count(),
+                if report.failure_count() == 1 { "y" } else { "ies" }
+            );
+            warn!("{}", details.trim_end());
+        }
+    }
     info!("linker validation succeeded");
     Ok(())
 }
@@ -198,6 +222,10 @@ struct CreateArgs {
     /// Runtime tracing mode
     #[arg(long = "trace-mode", value_enum, default_value_t = TraceMode::Auto)]
     trace_mode: TraceMode,
+
+    /// Fail the build when linker validation finds missing dependencies
+    #[arg(long = "strict-validate")]
+    strict_validate: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -359,18 +387,36 @@ fn build_with_backend(
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "docker provider invocation failed")?;
-            let closure =
-                build_closure_from_root("docker", reference, target, root.rootfs(), paths, trace_mode)?;
-            Ok(ImageClosureResult { closure, guard: root })
+            let closure = build_closure_from_root(
+                "docker",
+                reference,
+                target,
+                root.rootfs(),
+                paths,
+                trace_mode,
+            )?;
+            Ok(ImageClosureResult {
+                closure,
+                guard: root,
+            })
         }
         BackendPreference::Podman | BackendPreference::Auto => {
             let provider = PodmanProvider::new();
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            let closure =
-                build_closure_from_root("podman", reference, target, root.rootfs(), paths, trace_mode)?;
-            Ok(ImageClosureResult { closure, guard: root })
+            let closure = build_closure_from_root(
+                "podman",
+                reference,
+                target,
+                root.rootfs(),
+                paths,
+                trace_mode,
+            )?;
+            Ok(ImageClosureResult {
+                closure,
+                guard: root,
+            })
         }
     }
 }
@@ -494,8 +540,68 @@ fn log_merge_report(reference: &str, report: &MergeReport) {
             );
         }
         if report.conflicts.len() > 3 {
-            warn!(" - {} additional conflicts suppressed", report.conflicts.len() - 3);
+            warn!(
+                " - {} additional conflicts suppressed",
+                report.conflicts.len() - 3
+            );
         }
+    }
+}
+
+fn log_validation_report(report: &ValidationReport) {
+    for entry in &report.entries {
+        match entry.status {
+            EntryValidationStatus::StaticOk | EntryValidationStatus::DynamicOk { .. } => {
+                info!(
+                    "validation ok: {} ({})",
+                    entry.display_name,
+                    describe_status(&entry.status)
+                );
+            }
+            _ => {
+                warn!(
+                    "validation issue: {} ({})",
+                    entry.display_name,
+                    describe_status(&entry.status)
+                );
+            }
+        }
+    }
+}
+
+fn describe_status(status: &EntryValidationStatus) -> String {
+    match status {
+        EntryValidationStatus::StaticOk => "static entry".to_string(),
+        EntryValidationStatus::DynamicOk { resolved } => {
+            format!("dynamic entry (resolved {} libs)", resolved)
+        }
+        EntryValidationStatus::MissingBinary => "binary missing".to_string(),
+        EntryValidationStatus::MissingLinker => "linker missing".to_string(),
+        EntryValidationStatus::LinkerError { error } => match error {
+            LinkerFailure::Spawn { linker, message } => {
+                format!("failed to spawn linker {}: {}", linker.display(), message)
+            }
+            LinkerFailure::CommandFailed {
+                linker,
+                status,
+                stderr,
+            } => format!(
+                "linker {} exited {:?}: {}",
+                linker.display(),
+                status,
+                stderr
+            ),
+            LinkerFailure::LibraryNotFound { name, raw } => {
+                format!("missing library {} ({})", name, raw)
+            }
+            LinkerFailure::InvalidPath { path } => {
+                format!("invalid path {}", path.display())
+            }
+            LinkerFailure::PathOutsideRoot { path, root } => {
+                format!("path {} outside chroot {}", path.display(), root.display())
+            }
+            LinkerFailure::Other { message } => message.clone(),
+        },
     }
 }
 

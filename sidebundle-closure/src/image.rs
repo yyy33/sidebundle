@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[allow(deprecated)]
-use bollard::container::{Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions};
+use bollard::container::{
+    Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
+};
 use bollard::errors::Error as BollardError;
 use bollard::{Docker, API_DEFAULT_VERSION};
 use futures_util::StreamExt;
@@ -32,7 +34,10 @@ pub struct ImageConfig {
 
 impl ImageConfig {
     pub fn is_empty(&self) -> bool {
-        self.workdir.is_none() && self.entrypoint.is_empty() && self.cmd.is_empty() && self.env.is_empty()
+        self.workdir.is_none()
+            && self.entrypoint.is_empty()
+            && self.cmd.is_empty()
+            && self.env.is_empty()
     }
 }
 
@@ -45,7 +50,11 @@ pub struct ImageRoot {
 }
 
 impl ImageRoot {
-    pub fn new(reference: impl Into<String>, rootfs_path: impl Into<PathBuf>, config: ImageConfig) -> Self {
+    pub fn new(
+        reference: impl Into<String>,
+        rootfs_path: impl Into<PathBuf>,
+        config: ImageConfig,
+    ) -> Self {
         Self {
             reference: reference.into(),
             rootfs_path: rootfs_path.into(),
@@ -145,13 +154,14 @@ impl DockerProvider {
         RuntimeBuilder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|err| ImageProviderError::Other(format!("failed to init tokio runtime: {err}")))
+            .map_err(|err| {
+                ImageProviderError::Other(format!("failed to init tokio runtime: {err}"))
+            })
     }
 
     async fn prepare_with_bollard(&self, reference: &str) -> Result<ImageRoot, ImageProviderError> {
-        let docker = Docker::connect_with_local_defaults().map_err(|err| {
-            ImageProviderError::unavailable("docker-bollard", err.to_string())
-        })?;
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|err| ImageProviderError::unavailable("docker-bollard", err.to_string()))?;
         let docker = docker
             .negotiate_version()
             .await
@@ -178,7 +188,6 @@ impl DockerProvider {
         let cleanup_dir = tempdir;
         Ok(ImageRoot::new(reference, rootfs_path, config).with_cleanup(move || drop(cleanup_dir)))
     }
-
 }
 
 impl ImageRootProvider for DockerProvider {
@@ -195,10 +204,7 @@ impl ImageRootProvider for DockerProvider {
         match runtime.block_on(self.prepare_with_bollard(trimmed)) {
             Ok(root) => Ok(root),
             Err(err) => {
-                warn!(
-                    "docker bollard path failed ({}), falling back to CLI",
-                    err
-                );
+                warn!("docker bollard path failed ({}), falling back to CLI", err);
                 self.prepare_with_cli(trimmed)
             }
         }
@@ -240,7 +246,9 @@ impl PodmanProvider {
         RuntimeBuilder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|err| ImageProviderError::Other(format!("failed to init tokio runtime: {err}")))
+            .map_err(|err| {
+                ImageProviderError::Other(format!("failed to init tokio runtime: {err}"))
+            })
     }
 
     fn prepare_with_cli(&self, reference: &str) -> Result<ImageRoot, ImageProviderError> {
@@ -304,11 +312,12 @@ impl PodmanProvider {
         let runtime = self.create_runtime()?;
         let result = runtime.block_on(async {
             let docker = Docker::connect_with_unix(&socket_uri, 120, &API_DEFAULT_VERSION)
-                .map_err(|err| ImageProviderError::unavailable("podman-service", err.to_string()))?;
-            let docker = docker
-                .negotiate_version()
-                .await
-                .map_err(|err| ImageProviderError::unavailable("podman-service", err.to_string()))?;
+                .map_err(|err| {
+                    ImageProviderError::unavailable("podman-service", err.to_string())
+                })?;
+            let docker = docker.negotiate_version().await.map_err(|err| {
+                ImageProviderError::unavailable("podman-service", err.to_string())
+            })?;
             prepare_reference_with_bollard(&docker, reference).await
         });
         guard.shutdown();
@@ -471,7 +480,10 @@ impl Drop for PodmanServiceGuard {
 #[derive(Debug, Error)]
 pub enum ImageProviderError {
     #[error("provider `{backend}` unavailable: {reason}")]
-    Unavailable { backend: &'static str, reason: String },
+    Unavailable {
+        backend: &'static str,
+        reason: String,
+    },
     #[error("image reference is empty")]
     EmptyReference,
     #[error("image `{reference}` not found: {message}")]
@@ -634,7 +646,10 @@ async fn prepare_reference_with_bollard(
 ) -> Result<ImageRoot, ImageProviderError> {
     let create = docker
         .create_container(
-            Some(CreateContainerOptions { name: "", platform: None }),
+            Some(CreateContainerOptions {
+                name: "",
+                platform: None,
+            }),
             ContainerConfig {
                 image: Some(reference),
                 ..Default::default()
@@ -775,14 +790,8 @@ mod tests {
             cfg.entrypoint,
             vec![String::from("/bin/sh"), String::from("-c")]
         );
-        assert_eq!(
-            cfg.cmd,
-            vec![String::from("run"), String::from("service")]
-        );
-        assert_eq!(
-            cfg.env,
-            vec![String::from("A=1"), String::from("B=2")]
-        );
+        assert_eq!(cfg.cmd, vec![String::from("run"), String::from("service")]);
+        assert_eq!(cfg.env, vec![String::from("A=1"), String::from("B=2")]);
     }
 
     #[test]
