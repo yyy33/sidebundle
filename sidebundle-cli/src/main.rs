@@ -8,7 +8,7 @@ use env_logger::Env;
 use log::{debug, info, warn, LevelFilter};
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
-    trace::TraceCollector,
+    trace::{TraceBackendKind, TraceCollector},
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ClosureBuilder,
 };
@@ -79,7 +79,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         builder = builder.with_chroot_root(root.clone());
     }
     if trace_mode != TraceMode::Off {
-        let mut tracer = TraceCollector::new();
+        let mut tracer = TraceCollector::new().with_backend(TraceBackendKind::combined());
         if let Some(root) = &trace_root {
             tracer = tracer.with_root(root.clone());
         }

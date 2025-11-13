@@ -1,41 +1,200 @@
+use nix::errno::Errno;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::*;
+pub use linux::{CombinedBackend, FanotifyBackend, PtraceBackend};
 
-#[cfg(not(target_os = "linux"))]
-mod unsupported {
-    use std::path::PathBuf;
+/// Trace runner wrapper that allows swapping implementations.
+#[derive(Debug, Clone)]
+pub struct TraceCollector {
+    backend: TraceBackendKind,
+    root: Option<PathBuf>,
+}
 
-    #[derive(Debug, Default, Clone)]
-    pub struct TraceCollector;
-
-    impl TraceCollector {
-        pub fn new() -> Self {
-            Self
-        }
-
-        pub fn with_root(self, _root: impl Into<PathBuf>) -> Self {
-            self
-        }
-
-        pub fn run(&self, _cmd: &[String]) -> Result<TraceReport, TraceError> {
-            Err(TraceError::Unsupported(
-                "ptrace tracing is only available on Linux",
-            ))
+impl TraceCollector {
+    pub fn new() -> Self {
+        Self {
+            backend: TraceBackendKind::default(),
+            root: None,
         }
     }
 
-    #[derive(Debug, Clone, Default)]
-    pub struct TraceReport;
+    pub fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = Some(root.into());
+        self
+    }
 
-    #[derive(thiserror::Error, Debug)]
-    pub enum TraceError {
-        #[error("{0}")]
-        Unsupported(&'static str),
+    pub fn with_backend(mut self, backend: TraceBackendKind) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub fn run(&self, command: &[String]) -> Result<TraceReport, TraceError> {
+        if command.is_empty() {
+            return Err(TraceError::EmptyCommand);
+        }
+        let invocation = TraceInvocation {
+            command,
+            root: self.root.as_deref(),
+        };
+        self.backend.trace(&invocation)
     }
 }
 
+/// Execution context passed to trace backends.
+pub struct TraceInvocation<'a> {
+    pub command: &'a [String],
+    pub root: Option<&'a Path>,
+}
+
+/// Common trait implemented by concrete tracing backends.
+pub trait TraceBackend {
+    fn trace(&self, invocation: &TraceInvocation<'_>) -> Result<TraceReport, TraceError>;
+}
+
+/// Concrete backend selector used by TraceCollector.
+#[derive(Debug, Clone)]
+pub enum TraceBackendKind {
+    Null(NullBackend),
+    #[cfg(target_os = "linux")]
+    Ptrace(PtraceBackend),
+    #[cfg(target_os = "linux")]
+    Fanotify(FanotifyBackend),
+    #[cfg(target_os = "linux")]
+    Combined(CombinedBackend),
+}
+
+impl TraceBackendKind {
+    pub fn null() -> Self {
+        Self::Null(NullBackend::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn ptrace() -> Self {
+        Self::Ptrace(PtraceBackend::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn fanotify() -> Self {
+        Self::Fanotify(FanotifyBackend::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn combined() -> Self {
+        Self::Combined(CombinedBackend::new())
+    }
+
+    fn trace(&self, invocation: &TraceInvocation<'_>) -> Result<TraceReport, TraceError> {
+        match self {
+            TraceBackendKind::Null(backend) => backend.trace(invocation),
+            #[cfg(target_os = "linux")]
+            TraceBackendKind::Ptrace(backend) => backend.trace(invocation),
+            #[cfg(target_os = "linux")]
+            TraceBackendKind::Fanotify(backend) => backend.trace(invocation),
+            #[cfg(target_os = "linux")]
+            TraceBackendKind::Combined(backend) => backend.trace(invocation),
+        }
+    }
+}
+
+impl Default for TraceBackendKind {
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            return TraceBackendKind::ptrace();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TraceBackendKind::Null(NullBackend::unsupported())
+        }
+    }
+}
+
+/// Trace backend that performs no collection.
+#[derive(Debug, Clone, Default)]
+pub struct NullBackend {
+    fail_on_use: bool,
+}
+
+impl NullBackend {
+    pub fn new() -> Self {
+        Self { fail_on_use: false }
+    }
+
+    pub fn unsupported() -> Self {
+        Self { fail_on_use: true }
+    }
+}
+
+impl TraceBackend for NullBackend {
+    fn trace(&self, _invocation: &TraceInvocation<'_>) -> Result<TraceReport, TraceError> {
+        if self.fail_on_use {
+            Err(TraceError::Unsupported(
+                "runtime tracing is only available on Linux",
+            ))
+        } else {
+            Ok(TraceReport::default())
+        }
+    }
+}
+
+/// Aggregated trace output.
+#[derive(Debug, Clone, Default)]
+pub struct TraceReport {
+    pub files: BTreeSet<PathBuf>,
+}
+
+impl TraceReport {
+    pub fn record_path(&mut self, path: PathBuf) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        self.files.insert(path);
+    }
+
+    pub fn extend(&mut self, other: TraceReport) {
+        for path in other.files {
+            self.files.insert(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_dedup() {
+        let mut report = TraceReport::default();
+        report.record_path(PathBuf::from("/tmp/a"));
+        report.record_path(PathBuf::from("/tmp/a"));
+        assert_eq!(report.files.len(), 1);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TraceError {
+    #[error("empty command")]
+    EmptyCommand,
+    #[error("failed to convert string: {0}")]
+    CString(#[from] std::ffi::NulError),
+    #[error("IO: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("nix error: {0}")]
+    Nix(Errno),
+    #[error("ptrace not permitted: {0}")]
+    Permission(String),
+    #[error("traced process exited unexpectedly")]
+    UnexpectedExit,
+    #[error("fanotify unavailable: {0}")]
+    Fanotify(String),
+    #[error("{0}")]
+    Unsupported(&'static str),
+}
+
 #[cfg(not(target_os = "linux"))]
-pub use unsupported::*;
+mod linux {}

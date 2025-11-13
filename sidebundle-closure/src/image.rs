@@ -14,6 +14,8 @@ use bollard::errors::Error as BollardError;
 use bollard::{Docker, API_DEFAULT_VERSION};
 use futures_util::StreamExt;
 use log::warn;
+use nix::errno::Errno;
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use serde_json::Value;
 use tar::Archive;
 use tempfile::TempDir;
@@ -47,6 +49,7 @@ pub struct ImageRoot {
     rootfs_path: PathBuf,
     config: ImageConfig,
     cleanup: Option<Box<dyn CleanupHook>>,
+    mounted: bool,
 }
 
 impl ImageRoot {
@@ -60,6 +63,7 @@ impl ImageRoot {
             rootfs_path: rootfs_path.into(),
             config,
             cleanup: None,
+            mounted: false,
         }
     }
 
@@ -95,10 +99,22 @@ impl ImageRoot {
         let config = std::mem::take(&mut self.config);
         (reference, rootfs, config)
     }
+
+    pub fn with_mounted_root(mut self) -> Result<Self, ImageProviderError> {
+        if self.mounted {
+            return Ok(self);
+        }
+        bind_mount(&self.rootfs_path)?;
+        self.mounted = true;
+        Ok(self)
+    }
 }
 
 impl Drop for ImageRoot {
     fn drop(&mut self) {
+        if self.mounted {
+            let _ = umount2(&self.rootfs_path, MntFlags::MNT_DETACH);
+        }
         if let Some(cleanup) = self.cleanup.take() {
             cleanup.call();
         }
@@ -186,7 +202,10 @@ impl DockerProvider {
         drop(guard);
 
         let cleanup_dir = tempdir;
-        Ok(ImageRoot::new(reference, rootfs_path, config).with_cleanup(move || drop(cleanup_dir)))
+        let root = ImageRoot::new(reference, rootfs_path, config)
+            .with_cleanup(move || drop(cleanup_dir))
+            .with_mounted_root()?;
+        Ok(root)
     }
 }
 
@@ -284,7 +303,10 @@ impl PodmanProvider {
 
         let config = inspect_image_from_cli(&self.cli_path, reference, "podman-cli")?;
         let cleanup = guard.into_mount_cleanup();
-        Ok(ImageRoot::new(reference, mount_path, config).with_cleanup(move || cleanup.cleanup()))
+        let root = ImageRoot::new(reference, mount_path, config)
+            .with_cleanup(move || cleanup.cleanup())
+            .with_mounted_root()?;
+        Ok(root)
     }
 
     fn prepare_cli_export(
@@ -304,7 +326,10 @@ impl PodmanProvider {
         let config = inspect_image_from_cli(&self.cli_path, reference, "podman-cli")?;
         guard.remove_now();
         let cleanup_dir = tempdir;
-        Ok(ImageRoot::new(reference, rootfs_path, config).with_cleanup(move || drop(cleanup_dir)))
+        let root = ImageRoot::new(reference, rootfs_path, config)
+            .with_cleanup(move || drop(cleanup_dir))
+            .with_mounted_root()?;
+        Ok(root)
     }
 
     fn prepare_with_service(&self, reference: &str) -> Result<ImageRoot, ImageProviderError> {
@@ -718,6 +743,36 @@ fn parse_mount_output(raw: &str) -> Option<PathBuf> {
         .map(|line| line.trim())
         .find(|line| !line.is_empty())
         .map(PathBuf::from)
+}
+
+fn bind_mount(path: &Path) -> Result<(), ImageProviderError> {
+    mount(
+        Some(path),
+        path,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .map_err(|err| {
+        ImageProviderError::Other(format!("failed to bind-mount {}: {}", path.display(), err))
+    })?;
+
+    if let Err(err) = mount::<Path, Path, str, str>(
+        None,
+        path,
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    ) {
+        if err != Errno::EINVAL {
+            return Err(ImageProviderError::Other(format!(
+                "failed to remount {} private: {}",
+                path.display(),
+                err
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) -> Result<(), ImageProviderError> {

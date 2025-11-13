@@ -94,11 +94,13 @@ impl ClosureBuilder {
             let plan = self.build_entry(entry, &mut file_map, &mut elf_cache)?;
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
-                match tracer.run(&[entry.path.to_string_lossy().to_string()]) {
+                let trace_path = self.trace_path_for_entry(&entry.path);
+                match tracer.run(&[trace_path]) {
                     Ok(report) => traced_files.extend(
                         report
                             .files
                             .into_iter()
+                            .filter_map(|path| self.rebase_trace_path(&path))
                             .filter(|path| trace_path_allowed(path)),
                     ),
                     Err(err) => debug!("trace for `{}` failed: {err}", entry.path.display()),
@@ -121,6 +123,30 @@ impl ClosureBuilder {
             entry_plans,
             traced_files: traced_files.into_iter().collect(),
         })
+    }
+
+    fn trace_path_for_entry(&self, path: &Path) -> String {
+        if let Some(root) = &self.chroot_root {
+            if let Ok(stripped) = path.strip_prefix(root) {
+                let mut rebuilt = PathBuf::from("/");
+                rebuilt.push(stripped);
+                return rebuilt.display().to_string();
+            }
+        }
+        path.display().to_string()
+    }
+
+    fn rebase_trace_path(&self, path: &Path) -> Option<PathBuf> {
+        if self.chroot_root.is_none() {
+            return Some(path.to_path_buf());
+        }
+        let root = self.chroot_root.as_ref().unwrap();
+        if path.is_absolute() {
+            let stripped = path.strip_prefix("/").unwrap_or(path);
+            Some(root.join(stripped))
+        } else {
+            Some(root.join(path))
+        }
     }
 
     fn build_entry(
@@ -375,12 +401,10 @@ fn trace_path_allowed(path: &Path) -> bool {
             return false;
         }
     }
-    if let Ok(meta) = fs::metadata(path) {
-        if !meta.is_file() {
-            return false;
-        }
+    match fs::metadata(path) {
+        Ok(meta) => meta.is_file(),
+        Err(_) => false,
     }
-    true
 }
 
 #[derive(Debug, Error)]
