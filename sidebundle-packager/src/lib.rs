@@ -111,29 +111,32 @@ impl Packager {
         }
 
         let mut traced_manifest = Vec::new();
-        for path in &closure.traced_files {
-            match fs::metadata(path) {
+        for traced in &closure.traced_files {
+            match fs::metadata(&traced.resolved) {
                 Ok(meta) if meta.is_file() => {}
                 Ok(_) => {
                     warn!(
                         "traced path {} is not a regular file, skipping",
-                        path.display()
+                        traced.original.display()
                     );
                     continue;
                 }
                 Err(err) => {
-                    warn!("failed to read traced path {}: {err}", path.display());
+                    warn!(
+                        "failed to read traced path {}: {err}",
+                        traced.resolved.display()
+                    );
                     continue;
                 }
             }
-            let digest = compute_digest(path)?;
-            let stored = store_in_data(&data_dir, path, &digest)?;
-            let destination = traced_destination(path);
+            let digest = compute_digest(&traced.resolved)?;
+            let stored = store_in_data(&data_dir, &traced.resolved, &digest)?;
+            let destination = traced_destination(&traced.original);
             let dest_path = bundle_root.join(&destination);
             link_or_copy(&stored, &dest_path)?;
             traced_manifest.push(ManifestFile {
                 origin: FileOrigin::Trace,
-                source: path.display().to_string(),
+                source: traced.original.display().to_string(),
                 destination,
                 digest,
             });

@@ -6,9 +6,9 @@ use nix::sys::ptrace::{self, AddressType};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{chdir, chroot, execve, fork, ForkResult, Pid};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -29,7 +29,7 @@ impl PtraceBackend {
 
 impl TraceBackend for PtraceBackend {
     fn trace(&self, invocation: &TraceInvocation<'_>) -> Result<TraceReport, TraceError> {
-        run_ptrace(invocation.command, invocation.root)
+        run_ptrace(invocation)
     }
 }
 
@@ -59,7 +59,7 @@ impl Default for FanotifyBackend {
 
 impl TraceBackend for FanotifyBackend {
     fn trace(&self, invocation: &TraceInvocation<'_>) -> Result<TraceReport, TraceError> {
-        run_fanotify(invocation.command, invocation.root, self.mask)
+        run_fanotify(invocation, self.mask)
     }
 }
 
@@ -85,26 +85,25 @@ impl TraceBackend for CombinedBackend {
     }
 }
 
-fn run_ptrace(command: &[String], root: Option<&Path>) -> Result<TraceReport, TraceError> {
-    let argv = strings_to_cstring(command)?;
-    let envp = envp_to_cstring()?;
+fn run_ptrace(invocation: &TraceInvocation<'_>) -> Result<TraceReport, TraceError> {
+    let argv = strings_to_cstring(invocation.command)?;
+    let envp = envp_to_cstring(invocation.env)?;
 
     unsafe {
         match fork().map_err(TraceError::Nix)? {
-            ForkResult::Child => ptrace_child_main(root, &argv, &envp),
+            ForkResult::Child => ptrace_child_main(invocation.root, &argv, &envp),
             ForkResult::Parent { child } => parent_trace(child),
         }
     }
 }
 
 fn run_fanotify(
-    command: &[String],
-    root: Option<&Path>,
+    invocation: &TraceInvocation<'_>,
     mask: MaskFlags,
 ) -> Result<TraceReport, TraceError> {
-    let argv = strings_to_cstring(command)?;
-    let envp = envp_to_cstring()?;
-    let watch_root = root.unwrap_or_else(|| Path::new("/"));
+    let argv = strings_to_cstring(invocation.command)?;
+    let envp = envp_to_cstring(invocation.env)?;
+    let watch_root = invocation.root.unwrap_or_else(|| Path::new("/"));
 
     let fan = Fanotify::init(
         InitFlags::FAN_CLOEXEC | InitFlags::FAN_CLASS_NOTIF | InitFlags::FAN_NONBLOCK,
@@ -121,7 +120,7 @@ fn run_fanotify(
 
     unsafe {
         match fork().map_err(TraceError::Nix)? {
-            ForkResult::Child => fanotify_child_main(root, &argv, &envp),
+            ForkResult::Child => fanotify_child_main(invocation.root, &argv, &envp),
             ForkResult::Parent { child } => fanotify_parent(child, fan),
         }
     }
@@ -134,8 +133,12 @@ fn strings_to_cstring(values: &[String]) -> Result<Vec<CString>, TraceError> {
         .collect()
 }
 
-fn envp_to_cstring() -> Result<Vec<CString>, TraceError> {
-    env::vars_os()
+fn envp_to_cstring(overrides: &[(OsString, OsString)]) -> Result<Vec<CString>, TraceError> {
+    let mut map: BTreeMap<OsString, OsString> = env::vars_os().collect();
+    for (key, value) in overrides {
+        map.insert(key.clone(), value.clone());
+    }
+    map.into_iter()
         .map(|(k, v)| {
             let mut bytes = Vec::new();
             bytes.extend(k.as_os_str().as_bytes());

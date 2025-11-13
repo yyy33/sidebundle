@@ -172,7 +172,7 @@ pub struct EntryBundlePlan {
 pub struct DependencyClosure {
     pub files: Vec<ResolvedFile>,
     pub entry_plans: Vec<EntryBundlePlan>,
-    pub traced_files: Vec<PathBuf>,
+    pub traced_files: Vec<TracedFile>,
 }
 
 impl DependencyClosure {
@@ -197,7 +197,11 @@ impl DependencyClosure {
             .iter()
             .map(|plan| plan.display_name.clone())
             .collect();
-        let mut traced_set: HashSet<PathBuf> = self.traced_files.iter().cloned().collect();
+        let mut traced_set: HashSet<PathBuf> = self
+            .traced_files
+            .iter()
+            .map(|file| file.resolved.clone())
+            .collect();
 
         let mut report = MergeReport::default();
 
@@ -233,7 +237,7 @@ impl DependencyClosure {
         }
 
         for traced in other.traced_files {
-            if traced_set.insert(traced.clone()) {
+            if traced_set.insert(traced.resolved.clone()) {
                 report.traced_added += 1;
                 self.traced_files.push(traced);
             }
@@ -241,6 +245,13 @@ impl DependencyClosure {
 
         report
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TracedFile {
+    pub original: PathBuf,
+    pub resolved: PathBuf,
+    pub is_elf: bool,
 }
 
 #[derive(Debug, Default)]
@@ -282,7 +293,11 @@ mod tests {
         let mut base = DependencyClosure {
             files: vec![ResolvedFile::new("/a", "payload/bin/a", "hash-one")],
             entry_plans: Vec::new(),
-            traced_files: vec![PathBuf::from("/etc/ssl/cert.pem")],
+            traced_files: vec![TracedFile {
+                original: PathBuf::from("/etc/ssl/cert.pem"),
+                resolved: PathBuf::from("/etc/ssl/cert.pem"),
+                is_elf: false,
+            }],
         };
 
         let other = DependencyClosure {
@@ -292,8 +307,16 @@ mod tests {
             ],
             entry_plans: Vec::new(),
             traced_files: vec![
-                PathBuf::from("/etc/ssl/cert.pem"),
-                PathBuf::from("/tmp/runtime"),
+                TracedFile {
+                    original: PathBuf::from("/etc/ssl/cert.pem"),
+                    resolved: PathBuf::from("/etc/ssl/cert.pem"),
+                    is_elf: false,
+                },
+                TracedFile {
+                    original: PathBuf::from("/tmp/runtime"),
+                    resolved: PathBuf::from("/tmp/runtime"),
+                    is_elf: false,
+                },
             ],
         };
 

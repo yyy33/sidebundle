@@ -14,7 +14,7 @@ use log::debug;
 use sha2::{Digest, Sha256};
 use sidebundle_core::{
     parse_elf_metadata, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata, ElfParseError,
-    EntryBundlePlan, ResolvedFile,
+    EntryBundlePlan, ResolvedFile, TracedFile,
 };
 use thiserror::Error;
 
@@ -87,7 +87,7 @@ impl ClosureBuilder {
 
         let mut file_map: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
         let mut entry_plans = Vec::new();
-        let mut traced_files = BTreeSet::new();
+        let mut traced_map: BTreeMap<PathBuf, TracedFile> = BTreeMap::new();
         let mut elf_cache: HashMap<PathBuf, ElfMetadata> = HashMap::new();
 
         for entry in spec.entries() {
@@ -96,17 +96,22 @@ impl ClosureBuilder {
             if let Some(tracer) = &self.tracer {
                 let trace_path = self.trace_path_for_entry(&entry.path);
                 match tracer.run(&[trace_path]) {
-                    Ok(report) => traced_files.extend(
-                        report
-                            .files
-                            .into_iter()
-                            .filter_map(|path| self.rebase_trace_path(&path))
-                            .filter(|path| trace_path_allowed(path)),
-                    ),
+                    Ok(report) => {
+                        for original in report.files {
+                            if let Some(artifact) = self.make_trace_artifact(&original) {
+                                traced_map
+                                    .entry(artifact.resolved.clone())
+                                    .or_insert(artifact);
+                            }
+                        }
+                    }
                     Err(err) => debug!("trace for `{}` failed: {err}", entry.path.display()),
                 }
             }
         }
+
+        let traced_files: Vec<TracedFile> = traced_map.values().cloned().collect();
+        self.promote_traced_elves(&mut file_map, &mut elf_cache, &traced_files)?;
 
         let mut files = Vec::new();
         for (source, destination) in file_map.into_iter() {
@@ -121,7 +126,7 @@ impl ClosureBuilder {
         Ok(DependencyClosure {
             files,
             entry_plans,
-            traced_files: traced_files.into_iter().collect(),
+            traced_files,
         })
     }
 
@@ -134,6 +139,19 @@ impl ClosureBuilder {
             }
         }
         path.display().to_string()
+    }
+
+    fn make_trace_artifact(&self, original: &Path) -> Option<TracedFile> {
+        let resolved = self.rebase_trace_path(original)?;
+        if !trace_path_allowed(&resolved) {
+            return None;
+        }
+        let is_elf = parse_elf_metadata(&resolved).is_ok();
+        Some(TracedFile {
+            original: original.to_path_buf(),
+            resolved,
+            is_elf,
+        })
     }
 
     fn rebase_trace_path(&self, path: &Path) -> Option<PathBuf> {
@@ -149,6 +167,30 @@ impl ClosureBuilder {
         }
     }
 
+    fn promote_traced_elves(
+        &self,
+        files: &mut BTreeMap<PathBuf, PathBuf>,
+        cache: &mut HashMap<PathBuf, ElfMetadata>,
+        traced: &[TracedFile],
+    ) -> Result<(), ClosureError> {
+        let mut promoted: HashSet<PathBuf> = HashSet::new();
+        for artifact in traced {
+            if !artifact.is_elf {
+                continue;
+            }
+            if !promoted.insert(artifact.resolved.clone()) {
+                continue;
+            }
+            let display = artifact
+                .original
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("traced-entry");
+            let _ = self.build_entry_plan(&artifact.resolved, display, files, cache)?;
+        }
+        Ok(())
+    }
+
     fn build_entry(
         &self,
         entry: &BundleEntry,
@@ -156,8 +198,18 @@ impl ClosureBuilder {
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         let entry_source = canonicalize(&entry.path, self.chroot_root.as_deref())?;
-        let entry_metadata = self.load_metadata(&entry_source, cache)?;
-        let entry_dest = ensure_file(files, &entry_source);
+        self.build_entry_plan(&entry_source, &entry.display_name, files, cache)
+    }
+
+    fn build_entry_plan(
+        &self,
+        entry_source: &Path,
+        display_name: &str,
+        files: &mut BTreeMap<PathBuf, PathBuf>,
+        cache: &mut HashMap<PathBuf, ElfMetadata>,
+    ) -> Result<EntryBundlePlan, ClosureError> {
+        let entry_metadata = self.load_metadata(entry_source, cache)?;
+        let entry_dest = ensure_file(files, entry_source);
 
         let (interpreter_source, interpreter_dest, is_static) =
             match entry_metadata.interpreter.clone() {
@@ -176,7 +228,7 @@ impl ClosureBuilder {
 
         let mut visited: HashSet<PathBuf> = HashSet::new();
         let mut queue: VecDeque<PathBuf> = VecDeque::new();
-        queue.push_back(entry_source.clone());
+        queue.push_back(entry_source.to_path_buf());
 
         while let Some(current) = queue.pop_front() {
             if !visited.insert(current.clone()) {
@@ -196,7 +248,6 @@ impl ClosureBuilder {
                 if Self::should_skip(&resolution.name) {
                     continue;
                 }
-
                 let canonical = canonicalize(&resolution.target, self.chroot_root.as_deref())?;
                 let dest = ensure_file(files, &canonical);
                 if let Some(dir) = dest.parent() {
@@ -209,10 +260,10 @@ impl ClosureBuilder {
         let libraries: Vec<PathBuf> = lib_dirs.into_iter().collect();
         let binary_destination = entry_dest.clone();
         Ok(EntryBundlePlan {
-            display_name: entry.display_name.clone(),
-            binary_source: entry_source.clone(),
+            display_name: display_name.to_string(),
+            binary_source: entry_source.to_path_buf(),
             binary_destination: binary_destination.clone(),
-            linker_source: interpreter_source.unwrap_or_else(|| entry_source.clone()),
+            linker_source: interpreter_source.unwrap_or_else(|| entry_source.to_path_buf()),
             linker_destination: interpreter_dest.unwrap_or_else(|| binary_destination.clone()),
             library_dirs: libraries,
             requires_linker: !is_static,

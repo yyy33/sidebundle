@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -387,14 +388,8 @@ fn build_with_backend(
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "docker provider invocation failed")?;
-            let closure = build_closure_from_root(
-                "docker",
-                reference,
-                target,
-                root.rootfs(),
-                paths,
-                trace_mode,
-            )?;
+            let closure =
+                build_closure_from_root("docker", reference, target, &root, paths, trace_mode)?;
             Ok(ImageClosureResult {
                 closure,
                 guard: root,
@@ -405,14 +400,8 @@ fn build_with_backend(
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            let closure = build_closure_from_root(
-                "podman",
-                reference,
-                target,
-                root.rootfs(),
-                paths,
-                trace_mode,
-            )?;
+            let closure =
+                build_closure_from_root("podman", reference, target, &root, paths, trace_mode)?;
             Ok(ImageClosureResult {
                 closure,
                 guard: root,
@@ -425,10 +414,12 @@ fn build_closure_from_root(
     backend_name: &'static str,
     reference: &str,
     target: TargetTriple,
-    rootfs: &Path,
+    root: &ImageRoot,
     entry_paths: &[PathBuf],
     trace_mode: TraceMode,
 ) -> Result<DependencyClosure> {
+    let rootfs = root.rootfs();
+    let image_env = parse_image_env(&root.config().env);
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
     for (idx, virtual_path) in entry_paths.iter().enumerate() {
         let physical = physical_image_path(rootfs, virtual_path);
@@ -449,7 +440,10 @@ fn build_closure_from_root(
 
     let mut builder = ClosureBuilder::new().with_chroot_root(rootfs.to_path_buf());
     if trace_mode != TraceMode::Off {
-        let tracer = TraceCollector::new().with_root(rootfs.to_path_buf());
+        let mut tracer = TraceCollector::new().with_root(rootfs.to_path_buf());
+        if !image_env.is_empty() {
+            tracer = tracer.with_env(image_env.clone());
+        }
         builder = builder.with_tracer(tracer);
     }
 
@@ -546,6 +540,16 @@ fn log_merge_report(reference: &str, report: &MergeReport) {
             );
         }
     }
+}
+
+fn parse_image_env(vars: &[String]) -> Vec<(OsString, OsString)> {
+    let mut pairs = Vec::new();
+    for entry in vars {
+        if let Some((key, value)) = entry.split_once('=') {
+            pairs.push((OsString::from(key), OsString::from(value)));
+        }
+    }
+    pairs
 }
 
 fn log_validation_report(report: &ValidationReport) {

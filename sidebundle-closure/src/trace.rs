@@ -1,5 +1,6 @@
 use nix::errno::Errno;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -13,6 +14,7 @@ pub use linux::{CombinedBackend, FanotifyBackend, PtraceBackend};
 pub struct TraceCollector {
     backend: TraceBackendKind,
     root: Option<PathBuf>,
+    env: Vec<(OsString, OsString)>,
 }
 
 impl TraceCollector {
@@ -20,11 +22,17 @@ impl TraceCollector {
         Self {
             backend: TraceBackendKind::default(),
             root: None,
+            env: Vec::new(),
         }
     }
 
     pub fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = Some(root.into());
+        self
+    }
+
+    pub fn with_env(mut self, env: Vec<(OsString, OsString)>) -> Self {
+        self.env = env;
         self
     }
 
@@ -40,6 +48,7 @@ impl TraceCollector {
         let invocation = TraceInvocation {
             command,
             root: self.root.as_deref(),
+            env: &self.env,
         };
         self.backend.trace(&invocation)
     }
@@ -49,6 +58,7 @@ impl TraceCollector {
 pub struct TraceInvocation<'a> {
     pub command: &'a [String],
     pub root: Option<&'a Path>,
+    pub env: &'a [(OsString, OsString)],
 }
 
 /// Common trait implemented by concrete tracing backends.
