@@ -3,6 +3,7 @@ mod linker;
 pub mod trace;
 pub mod validator;
 
+use crate::image::ImageRoot;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -67,11 +68,26 @@ impl PathResolver for HostPathResolver {
 pub struct ChrootPathResolver {
     root: PathBuf,
     origin: Origin,
+    #[allow(dead_code)]
+    guard: Option<ImageRoot>,
 }
 
 impl ChrootPathResolver {
-    pub fn new(root: PathBuf, origin: Origin) -> Self {
-        Self { root, origin }
+    pub fn from_root(root: PathBuf, origin: Origin) -> Self {
+        Self {
+            root,
+            origin,
+            guard: None,
+        }
+    }
+
+    pub fn from_image(image: ImageRoot, origin: Origin) -> Self {
+        let root = image.rootfs().to_path_buf();
+        Self {
+            root,
+            origin,
+            guard: Some(image),
+        }
     }
 }
 
@@ -118,14 +134,40 @@ impl PathResolver for ChrootPathResolver {
     }
 }
 
+#[derive(Clone)]
+pub struct ResolverSet {
+    resolvers: HashMap<Origin, Arc<dyn PathResolver>>,
+}
+
+impl ResolverSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, origin: Origin, resolver: Arc<dyn PathResolver>) {
+        self.resolvers.insert(origin, resolver);
+    }
+
+    pub fn get(&self, origin: &Origin) -> Option<Arc<dyn PathResolver>> {
+        self.resolvers.get(origin).cloned()
+    }
+}
+
+impl Default for ResolverSet {
+    fn default() -> Self {
+        let mut map: HashMap<Origin, Arc<dyn PathResolver>> = HashMap::new();
+        map.insert(Origin::Host, Arc::new(HostPathResolver::default()));
+        Self { resolvers: map }
+    }
+}
+
 /// Builds dependency closures for host executables.
 pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
     default_paths: Vec<PathBuf>,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
-    chroot_root: Option<PathBuf>,
-    path_resolver: Arc<dyn PathResolver>,
+    resolvers: ResolverSet,
 }
 
 impl ClosureBuilder {
@@ -141,29 +183,17 @@ impl ClosureBuilder {
                 .collect(),
             runner: LinkerRunner::new(),
             tracer: None,
-            chroot_root: None,
-            path_resolver: Arc::new(HostPathResolver::default()),
+            resolvers: ResolverSet::new(),
         }
     }
 
-    pub fn with_chroot_root(mut self, root: impl Into<PathBuf>, origin: Origin) -> Self {
-        let root_buf = root.into();
-        self.chroot_root = Some(root_buf.clone());
-        self.path_resolver = Arc::new(ChrootPathResolver::new(root_buf.clone(), origin));
-        self.default_paths = DEFAULT_LIBRARY_DIRS
-            .iter()
-            .map(|dir| rebase_path(&root_buf, Path::new(dir)))
-            .collect();
-        self.ld_library_paths = self
-            .ld_library_paths
-            .into_iter()
-            .map(|path| rebase_path(&root_buf, &path))
-            .collect();
+    pub fn with_resolver_set(mut self, resolvers: ResolverSet) -> Self {
+        self.resolvers = resolvers;
         self
     }
 
-    pub fn with_path_resolver(mut self, resolver: Arc<dyn PathResolver>) -> Self {
-        self.path_resolver = resolver;
+    pub fn with_resolver(mut self, origin: Origin, resolver: Arc<dyn PathResolver>) -> Self {
+        self.resolvers.insert(origin, resolver);
         self
     }
 
@@ -179,19 +209,23 @@ impl ClosureBuilder {
 
         let mut file_map: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
         let mut entry_plans = Vec::new();
-        let mut traced_map: BTreeMap<PathBuf, TracedFile> = BTreeMap::new();
+        let mut traced_map: HashMap<Origin, BTreeMap<PathBuf, TracedFile>> = HashMap::new();
         let mut elf_cache: HashMap<PathBuf, ElfMetadata> = HashMap::new();
+        let mut traced_files_acc: Vec<TracedFile> = Vec::new();
 
         for entry in spec.entries() {
-            let plan = self.build_entry(entry, &mut file_map, &mut elf_cache)?;
+            let resolver = self.resolver_for(entry.logical.origin())?;
+            let plan = self.build_entry(entry, resolver.as_ref(), &mut file_map, &mut elf_cache)?;
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
                 let command = trace::TraceCommand::new(entry.logical.clone());
-                match tracer.run(self.path_resolver.as_ref(), &command) {
+                match tracer.run(resolver.as_ref(), &command) {
                     Ok(artifacts) => {
+                        let origin = entry.logical.origin().clone();
+                        let origin_map = traced_map.entry(origin).or_default();
                         for record in artifacts {
                             if let Some(artifact) = self.make_trace_artifact(&record) {
-                                traced_map
+                                origin_map
                                     .entry(artifact.resolved.clone())
                                     .or_insert(artifact);
                             }
@@ -205,8 +239,18 @@ impl ClosureBuilder {
             }
         }
 
-        let traced_files: Vec<TracedFile> = traced_map.values().cloned().collect();
-        self.promote_traced_elves(&mut file_map, &mut elf_cache, &traced_files)?;
+        for (origin, artifacts) in traced_map {
+            let resolver = self.resolver_for(&origin)?;
+            let traced_files: Vec<TracedFile> = artifacts.values().cloned().collect();
+            self.promote_traced_elves(
+                resolver.as_ref(),
+                &origin,
+                &mut file_map,
+                &mut elf_cache,
+                &traced_files,
+            )?;
+            traced_files_acc.extend(traced_files);
+        }
 
         let mut files = Vec::new();
         for (source, destination) in file_map.into_iter() {
@@ -221,21 +265,27 @@ impl ClosureBuilder {
         Ok(DependencyClosure {
             files,
             entry_plans,
-            traced_files,
+            traced_files: traced_files_acc,
         })
     }
 
-    fn canonical_entry_path(&self, logical: &LogicalPath) -> Result<PathBuf, ClosureError> {
-        canonicalize(
-            &self.path_resolver.to_host(logical),
-            self.chroot_root.as_deref(),
-        )
+    fn resolver_for(&self, origin: &Origin) -> Result<Arc<dyn PathResolver>, ClosureError> {
+        self.resolvers
+            .get(origin)
+            .ok_or_else(|| ClosureError::MissingResolver {
+                origin: origin.clone(),
+            })
     }
 
-    fn make_trace_artifact(
+    fn canonical_entry_path(
         &self,
-        original: &trace::TraceArtifact,
-    ) -> Option<TracedFile> {
+        resolver: &dyn PathResolver,
+        logical: &LogicalPath,
+    ) -> Result<PathBuf, ClosureError> {
+        canonicalize(&resolver.to_host(logical), resolver.trace_root())
+    }
+
+    fn make_trace_artifact(&self, original: &trace::TraceArtifact) -> Option<TracedFile> {
         let resolved = original.host_path.as_ref()?;
         if !trace_path_allowed(resolved) {
             return None;
@@ -251,6 +301,8 @@ impl ClosureBuilder {
 
     fn promote_traced_elves(
         &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
         files: &mut BTreeMap<PathBuf, PathBuf>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
         traced: &[TracedFile],
@@ -268,7 +320,8 @@ impl ClosureBuilder {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("traced-entry");
-            let _ = self.build_entry_plan(&artifact.resolved, display, files, cache)?;
+            let _ =
+                self.build_entry_plan(resolver, origin, &artifact.resolved, display, files, cache)?;
         }
         Ok(())
     }
@@ -276,15 +329,25 @@ impl ClosureBuilder {
     fn build_entry(
         &self,
         entry: &BundleEntry,
+        resolver: &dyn PathResolver,
         files: &mut BTreeMap<PathBuf, PathBuf>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
-        let entry_source = self.canonical_entry_path(&entry.logical)?;
-        self.build_entry_plan(&entry_source, &entry.display_name, files, cache)
+        let entry_source = self.canonical_entry_path(resolver, &entry.logical)?;
+        self.build_entry_plan(
+            resolver,
+            entry.logical.origin(),
+            &entry_source,
+            &entry.display_name,
+            files,
+            cache,
+        )
     }
 
     fn build_entry_plan(
         &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
         entry_source: &Path,
         display_name: &str,
         files: &mut BTreeMap<PathBuf, PathBuf>,
@@ -296,7 +359,7 @@ impl ClosureBuilder {
         let (interpreter_source, interpreter_dest, is_static) =
             match entry_metadata.interpreter.clone() {
                 Some(path) => {
-                    let canonical = canonicalize(&path, self.chroot_root.as_deref())?;
+                    let canonical = canonicalize(&path, resolver.trace_root())?;
                     let dest = ensure_file(files, &canonical);
                     (Some(canonical), Some(dest), false)
                 }
@@ -322,7 +385,7 @@ impl ClosureBuilder {
                 continue;
             }
             let interpreter = interpreter_source.as_ref().expect("static skipped");
-            let search_paths = self.compute_search_paths(&current, &metadata);
+            let search_paths = self.compute_search_paths(resolver, origin, &current, &metadata);
             let resolved =
                 self.trace_with_linker(interpreter, &current, &search_paths, metadata)?;
 
@@ -330,7 +393,7 @@ impl ClosureBuilder {
                 if Self::should_skip(&resolution.name) {
                     continue;
                 }
-                let canonical = canonicalize(&resolution.target, self.chroot_root.as_deref())?;
+                let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
                 let dest = ensure_file(files, &canonical);
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
@@ -367,9 +430,15 @@ impl ClosureBuilder {
         Ok(cache.get(path).expect("metadata cached"))
     }
 
-    fn compute_search_paths(&self, binary: &Path, metadata: &ElfMetadata) -> Vec<PathBuf> {
+    fn compute_search_paths(
+        &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        binary: &Path,
+        metadata: &ElfMetadata,
+    ) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        let origin = binary.parent().unwrap_or_else(|| Path::new("/"));
+        let binary_dir = binary.parent().unwrap_or_else(|| Path::new("/"));
         let preferred = if metadata.runpaths.is_empty() {
             &metadata.rpaths
         } else {
@@ -377,15 +446,37 @@ impl ClosureBuilder {
         };
 
         for segment in preferred {
-            if let Some(path) = Self::expand_origin(segment, origin) {
+            if let Some(path) = Self::expand_origin(segment, binary_dir) {
                 paths.push(path);
             }
         }
 
-        paths.extend(self.ld_library_paths.clone());
-        paths.push(origin.to_path_buf());
-        paths.extend(self.default_paths.clone());
+        paths.extend(Self::resolve_additional_paths(
+            resolver,
+            origin,
+            &self.ld_library_paths,
+        ));
+        paths.push(binary_dir.to_path_buf());
+        paths.extend(Self::resolve_additional_paths(
+            resolver,
+            origin,
+            &self.default_paths,
+        ));
         paths
+    }
+
+    fn resolve_additional_paths(
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        entries: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        entries
+            .iter()
+            .map(|path| {
+                let logical = LogicalPath::new(origin.clone(), path.clone());
+                resolver.to_host(&logical)
+            })
+            .collect()
     }
 
     fn expand_origin(segment: &str, origin: &Path) -> Option<PathBuf> {
@@ -509,17 +600,6 @@ fn compute_digest(path: &Path) -> Result<String, ClosureError> {
     Ok(hex)
 }
 
-fn rebase_path(root: &Path, path: &Path) -> PathBuf {
-    if path.starts_with(root) {
-        path.to_path_buf()
-    } else if path.is_absolute() {
-        let stripped = path.strip_prefix("/").unwrap_or(path);
-        root.join(stripped)
-    } else {
-        root.join(path)
-    }
-}
-
 fn trace_path_allowed(path: &Path) -> bool {
     if path.as_os_str().is_empty() {
         return false;
@@ -556,6 +636,8 @@ pub enum ClosureError {
     MissingInterpreter { path: PathBuf },
     #[error("linker trace failed for {path}: {source}")]
     LinkerTrace { path: PathBuf, source: LinkerError },
+    #[error("no resolver registered for origin {origin:?}")]
+    MissingResolver { origin: Origin },
 }
 
 #[cfg(test)]

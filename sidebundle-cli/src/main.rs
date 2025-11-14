@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -13,7 +14,7 @@ use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{TraceBackendKind, TraceCollector},
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
-    ClosureBuilder,
+    ChrootPathResolver, ClosureBuilder, ResolverSet,
 };
 use sidebundle_core::{
     BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, TargetTriple,
@@ -55,7 +56,8 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         target,
         out_dir,
         trace_root,
-        trace_mode,
+        trace_backend,
+        image_trace_backend,
         strict_validate,
     } = args;
 
@@ -86,12 +88,20 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         spec.push_entry(BundleSpec::host_entry(path, display));
     }
 
-    let mut builder = ClosureBuilder::new();
+    let host_backend =
+        resolve_trace_backend(trace_backend).context("failed to configure host trace backend")?;
+    let image_backend_choice = image_trace_backend.unwrap_or(trace_backend);
+    let image_backend_kind = resolve_trace_backend(image_backend_choice)
+        .context("failed to configure image trace backend")?;
+
+    let mut host_resolvers = ResolverSet::new();
     if let Some(root) = &trace_root {
-        builder = builder.with_chroot_root(root.clone(), Origin::Host);
+        let resolver = Arc::new(ChrootPathResolver::from_root(root.clone(), Origin::Host));
+        host_resolvers.insert(Origin::Host, resolver);
     }
-    if trace_mode != TraceMode::Off {
-        let tracer = TraceCollector::new().with_backend(TraceBackendKind::combined());
+    let mut builder = ClosureBuilder::new().with_resolver_set(host_resolvers.clone());
+    if let Some(backend) = host_backend.clone() {
+        let tracer = TraceCollector::new().with_backend(backend);
         builder = builder.with_tracer(tracer);
     }
 
@@ -102,7 +112,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
 
     let default_backend = BackendPreference::from(image_backend);
     let grouped = group_image_entries(&from_image, default_backend)?;
-    let mut image_guards = Vec::new();
+    let mut _resolver_guards = Vec::new();
     for ((preference, reference), paths) in grouped {
         info!(
             "constructing closure for image `{}` via {:?} backend ({} entr{} )",
@@ -111,16 +121,20 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             paths.len(),
             if paths.len() == 1 { "y" } else { "ies" }
         );
-        let image_result = build_image_closure(preference, &reference, &paths, target, trace_mode)
-            .with_context(|| {
-                format!(
-                    "failed to build closure for image `{reference}` using backend {preference:?}"
-                )
-            })?;
+        let image_result = build_image_closure(
+            preference,
+            &reference,
+            &paths,
+            target,
+            image_backend_kind.clone(),
+        )
+        .with_context(|| {
+            format!("failed to build closure for image `{reference}` using backend {preference:?}")
+        })?;
         log_closure_stats(&format!("image `{reference}`"), &image_result.closure);
         let report = closure.merge(image_result.closure);
         log_merge_report(&reference, &report);
-        image_guards.push(image_result.guard);
+        _resolver_guards.push(image_result.resolvers);
     }
 
     if closure.entry_plans.is_empty() {
@@ -207,11 +221,18 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
         spec.push_entry(BundleEntry::new(logical, display));
     }
 
-    let mut builder =
-        ClosureBuilder::new().with_chroot_root(args.rootfs.clone(), agent_origin);
-    if args.trace_mode != TraceMode::Off {
+    let mut resolver_set = ResolverSet::new();
+    let agent_resolver = Arc::new(ChrootPathResolver::from_root(
+        args.rootfs.clone(),
+        agent_origin.clone(),
+    ));
+    resolver_set.insert(agent_origin.clone(), agent_resolver);
+    let mut builder = ClosureBuilder::new().with_resolver_set(resolver_set.clone());
+    let agent_backend = resolve_trace_backend(args.trace_backend)
+        .context("failed to configure agent trace backend")?;
+    if let Some(kind) = agent_backend {
         let env_pairs = parse_image_env(&agent_spec.env);
-        let mut tracer = TraceCollector::new();
+        let mut tracer = TraceCollector::new().with_backend(kind);
         if !env_pairs.is_empty() {
             tracer = tracer.with_env(env_pairs);
         }
@@ -290,9 +311,13 @@ struct CreateArgs {
     #[arg(long = "trace-root", value_name = "DIR")]
     trace_root: Option<PathBuf>,
 
-    /// Runtime tracing mode
-    #[arg(long = "trace-mode", value_enum, default_value_t = TraceMode::Auto)]
-    trace_mode: TraceMode,
+    /// Runtime trace backend for host inputs
+    #[arg(long = "trace-backend", value_enum, default_value_t = TraceBackendArg::Auto)]
+    trace_backend: TraceBackendArg,
+
+    /// Runtime trace backend for image inputs
+    #[arg(long = "image-trace-backend", value_enum)]
+    image_trace_backend: Option<TraceBackendArg>,
 
     /// Fail the build when linker validation finds missing dependencies
     #[arg(long = "strict-validate")]
@@ -313,9 +338,9 @@ struct AgentTraceArgs {
     #[arg(long = "output", value_name = "DIR")]
     output: PathBuf,
 
-    /// Trace mode
-    #[arg(long = "trace-mode", value_enum, default_value_t = TraceMode::Auto)]
-    trace_mode: TraceMode,
+    /// Trace backend to use inside the agent
+    #[arg(long = "trace-backend", value_enum, default_value_t = TraceBackendArg::Auto)]
+    trace_backend: TraceBackendArg,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,9 +360,12 @@ struct AgentSpecEntry {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum TraceMode {
+enum TraceBackendArg {
     Off,
     Auto,
+    Ptrace,
+    Fanotify,
+    Combined,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -448,7 +476,7 @@ fn group_image_entries(
 
 struct ImageClosureResult {
     closure: DependencyClosure,
-    guard: ImageRoot,
+    resolvers: ResolverSet,
 }
 
 fn build_image_closure(
@@ -456,7 +484,7 @@ fn build_image_closure(
     reference: &str,
     paths: &[PathBuf],
     target: TargetTriple,
-    trace_mode: TraceMode,
+    trace_backend: Option<TraceBackendKind>,
 ) -> Result<ImageClosureResult> {
     if paths.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
@@ -467,7 +495,7 @@ fn build_image_closure(
     };
     let mut errors = Vec::new();
     for backend in attempts {
-        match build_with_backend(backend, reference, paths, target, trace_mode) {
+        match build_with_backend(backend, reference, paths, target, trace_backend.clone()) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 errors.push(format!("{backend:?}: {err:?}"));
@@ -485,7 +513,7 @@ fn build_with_backend(
     reference: &str,
     paths: &[PathBuf],
     target: TargetTriple,
-    trace_mode: TraceMode,
+    trace_backend: Option<TraceBackendKind>,
 ) -> Result<ImageClosureResult> {
     match backend {
         BackendPreference::Docker => {
@@ -493,24 +521,21 @@ fn build_with_backend(
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "docker provider invocation failed")?;
-            let closure =
-                build_closure_from_root("docker", reference, target, &root, paths, trace_mode)?;
-            Ok(ImageClosureResult {
-                closure,
-                guard: root,
-            })
+            build_closure_from_root(
+                "docker",
+                reference,
+                target,
+                &root,
+                paths,
+                trace_backend.clone(),
+            )
         }
         BackendPreference::Podman | BackendPreference::Auto => {
             let provider = PodmanProvider::new();
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            let closure =
-                build_closure_from_root("podman", reference, target, &root, paths, trace_mode)?;
-            Ok(ImageClosureResult {
-                closure,
-                guard: root,
-            })
+            build_closure_from_root("podman", reference, target, &root, paths, trace_backend)
         }
     }
 }
@@ -521,14 +546,14 @@ fn build_closure_from_root(
     target: TargetTriple,
     root: &ImageRoot,
     entry_paths: &[PathBuf],
-    trace_mode: TraceMode,
-) -> Result<DependencyClosure> {
-    let rootfs = root.rootfs();
+    trace_backend: Option<TraceBackendKind>,
+) -> Result<ImageClosureResult> {
+    let rootfs = root.rootfs().to_path_buf();
     let image_env = parse_image_env(&root.config().env);
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
     let origin = Origin::Image(reference.to_string());
     for (idx, virtual_path) in entry_paths.iter().enumerate() {
-        let physical = physical_image_path(rootfs, virtual_path);
+        let physical = physical_image_path(&rootfs, virtual_path);
         std::fs::metadata(&physical).with_context(|| {
             format!(
                 "image `{reference}` missing executable {} (resolved path {})",
@@ -545,9 +570,13 @@ fn build_closure_from_root(
         spec.push_entry(BundleEntry::new(logical, display));
     }
 
-    let mut builder = ClosureBuilder::new().with_chroot_root(rootfs.to_path_buf(), origin);
-    if trace_mode != TraceMode::Off {
-        let mut tracer = TraceCollector::new();
+    let mut resolvers = ResolverSet::new();
+    let chroot_resolver = Arc::new(ChrootPathResolver::from_image(root.clone(), origin.clone()));
+    resolvers.insert(origin.clone(), chroot_resolver);
+
+    let mut builder = ClosureBuilder::new().with_resolver_set(resolvers.clone());
+    if let Some(backend) = trace_backend {
+        let mut tracer = TraceCollector::new().with_backend(backend);
         if !image_env.is_empty() {
             tracer = tracer.with_env(image_env.clone());
         }
@@ -557,8 +586,8 @@ fn build_closure_from_root(
     let mut closure = builder
         .build(&spec)
         .with_context(|| format!("failed to build closure inside image `{reference}`"))?;
-    normalize_image_closure(&mut closure, rootfs);
-    Ok(closure)
+    normalize_image_closure(&mut closure, &rootfs);
+    Ok(ImageClosureResult { closure, resolvers })
 }
 
 fn physical_image_path(rootfs: &Path, virtual_path: &Path) -> PathBuf {
@@ -600,6 +629,52 @@ fn strip_payload_prefix(path: &Path, prefix: &Path) -> PathBuf {
         new_path
     } else {
         path.to_path_buf()
+    }
+}
+
+fn resolve_trace_backend(arg: TraceBackendArg) -> Result<Option<TraceBackendKind>> {
+    match arg {
+        TraceBackendArg::Off => Ok(None),
+        TraceBackendArg::Auto => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Some(TraceBackendKind::combined()))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Ok(Some(TraceBackendKind::null()))
+            }
+        }
+        TraceBackendArg::Ptrace => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Some(TraceBackendKind::ptrace()))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("ptrace backend is only available on Linux");
+            }
+        }
+        TraceBackendArg::Fanotify => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Some(TraceBackendKind::fanotify()))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("fanotify backend is only available on Linux");
+            }
+        }
+        TraceBackendArg::Combined => {
+            #[cfg(target_os = "linux")]
+            {
+                Ok(Some(TraceBackendKind::combined()))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("combined trace backend is only available on Linux");
+            }
+        }
     }
 }
 

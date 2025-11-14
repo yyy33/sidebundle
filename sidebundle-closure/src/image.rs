@@ -3,6 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,12 +48,17 @@ impl ImageConfig {
 }
 
 /// Handle representing a prepared image rootfs and associated metadata.
+#[derive(Clone)]
 pub struct ImageRoot {
+    inner: Arc<ImageRootInner>,
+}
+
+struct ImageRootInner {
     reference: String,
     rootfs_path: PathBuf,
     config: ImageConfig,
-    cleanup: Option<Box<dyn CleanupHook>>,
-    mounted: bool,
+    cleanup: Mutex<Option<Box<dyn CleanupHook>>>,
+    mounted: AtomicBool,
 }
 
 impl ImageRoot {
@@ -59,64 +68,89 @@ impl ImageRoot {
         config: ImageConfig,
     ) -> Self {
         Self {
-            reference: reference.into(),
-            rootfs_path: rootfs_path.into(),
-            config,
-            cleanup: None,
-            mounted: false,
+            inner: Arc::new(ImageRootInner {
+                reference: reference.into(),
+                rootfs_path: rootfs_path.into(),
+                config,
+                cleanup: Mutex::new(None),
+                mounted: AtomicBool::new(false),
+            }),
         }
     }
 
     pub fn reference(&self) -> &str {
-        &self.reference
+        &self.inner.reference
     }
 
     pub fn rootfs(&self) -> &Path {
-        &self.rootfs_path
+        &self.inner.rootfs_path
     }
 
     pub fn config(&self) -> &ImageConfig {
-        &self.config
+        &self.inner.config
     }
 
-    pub fn with_cleanup<F>(mut self, cleanup: F) -> Self
+    pub fn with_cleanup<F>(self, cleanup: F) -> Self
     where
         F: FnOnce() + Send + 'static,
     {
-        self.cleanup = Some(Box::new(cleanup));
-        self
-    }
-
-    pub fn detach_cleanup(mut self) -> Self {
-        self.cleanup = None;
-        self
-    }
-
-    pub fn into_parts(mut self) -> (String, PathBuf, ImageConfig) {
-        self.cleanup = None;
-        let reference = std::mem::take(&mut self.reference);
-        let rootfs = std::mem::take(&mut self.rootfs_path);
-        let config = std::mem::take(&mut self.config);
-        (reference, rootfs, config)
-    }
-
-    pub fn with_mounted_root(mut self) -> Result<Self, ImageProviderError> {
-        if self.mounted {
-            return Ok(self);
+        if let Ok(mut slot) = self.inner.cleanup.lock() {
+            *slot = Some(Box::new(cleanup));
         }
-        bind_mount(&self.rootfs_path)?;
-        self.mounted = true;
+        self
+    }
+
+    pub fn detach_cleanup(self) -> Self {
+        if let Ok(mut slot) = self.inner.cleanup.lock() {
+            *slot = None;
+        }
+        self
+    }
+
+    pub fn into_parts(self) -> (String, PathBuf, ImageConfig) {
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => inner.into_parts(),
+            Err(_) => panic!("ImageRoot::into_parts called while still shared"),
+        }
+    }
+
+    pub fn with_mounted_root(self) -> Result<Self, ImageProviderError> {
+        self.ensure_mounted()?;
         Ok(self)
+    }
+
+    pub fn ensure_mounted(&self) -> Result<(), ImageProviderError> {
+        if self.inner.mounted.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        bind_mount(&self.inner.rootfs_path)?;
+        self.inner.mounted.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
-impl Drop for ImageRoot {
+impl ImageRootInner {
+    fn into_parts(mut self) -> (String, PathBuf, ImageConfig) {
+        if let Some(slot) = self.cleanup.get_mut().ok() {
+            *slot = None;
+        }
+        (
+            std::mem::take(&mut self.reference),
+            std::mem::take(&mut self.rootfs_path),
+            std::mem::take(&mut self.config),
+        )
+    }
+}
+
+impl Drop for ImageRootInner {
     fn drop(&mut self) {
-        if self.mounted {
+        if self.mounted.swap(false, Ordering::SeqCst) {
             let _ = umount2(&self.rootfs_path, MntFlags::MNT_DETACH);
         }
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup.call();
+        if let Ok(mut slot) = self.cleanup.lock() {
+            if let Some(cleanup) = slot.take() {
+                cleanup.call();
+            }
         }
     }
 }
@@ -538,9 +572,9 @@ impl ImageProviderError {
 impl fmt::Debug for ImageRoot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ImageRoot")
-            .field("reference", &self.reference)
-            .field("rootfs_path", &self.rootfs_path)
-            .field("config", &self.config)
+            .field("reference", &self.reference())
+            .field("rootfs_path", &self.rootfs())
+            .field("config", &self.config())
             .finish_non_exhaustive()
     }
 }
