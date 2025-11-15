@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -13,8 +15,8 @@ use shell_words;
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{
-        TraceBackendKind, TraceCollector, TraceCommand as RuntimeTraceCommand, TraceSpec,
-        TraceSpecReport, TRACE_REPORT_VERSION,
+        AgentEngine, AgentEngineError, AgentTraceBackend, TraceBackendKind, TraceCollector,
+        TraceCommand as RuntimeTraceCommand, TraceSpec, TraceSpecReport, TRACE_REPORT_VERSION,
     },
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
     ChrootPathResolver, ClosureBuilder, ResolverSet,
@@ -23,6 +25,7 @@ use sidebundle_core::{
     BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, TargetTriple,
 };
 use sidebundle_packager::Packager;
+use tempfile::TempDir;
 
 fn main() {
     let cli = Cli::parse();
@@ -61,6 +64,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         trace_root,
         trace_backend,
         image_trace_backend,
+        image_agent_bin,
+        image_agent_cli,
+        image_agent_keep_output,
         strict_validate,
     } = args;
 
@@ -99,8 +105,18 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     let host_backend =
         resolve_trace_backend(trace_backend).context("failed to configure host trace backend")?;
     let image_backend_choice = image_trace_backend.unwrap_or(trace_backend);
-    let image_backend_kind = resolve_trace_backend(image_backend_choice)
-        .context("failed to configure image trace backend")?;
+    let agent_launch = if matches!(image_backend_choice, TraceBackendArg::Agent) {
+        Some(
+            AgentLaunchConfig::from_args(
+                image_agent_bin,
+                image_agent_cli,
+                image_agent_keep_output,
+            )
+            .context("failed to configure image agent settings")?,
+        )
+    } else {
+        None
+    };
 
     let mut host_resolvers = ResolverSet::new();
     if let Some(root) = &trace_root {
@@ -134,7 +150,8 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             &reference,
             &entries,
             target,
-            image_backend_kind.clone(),
+            image_backend_choice,
+            agent_launch.as_ref(),
         )
         .with_context(|| {
             format!("failed to build closure for image `{reference}` using backend {preference:?}")
@@ -244,7 +261,7 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
         schema_version: TRACE_REPORT_VERSION,
         files: files.into_iter().collect(),
     };
-    let report_path = args.output.join("trace-report.json");
+    let report_path = args.output.join("report.json");
     let tmp_path = report_path.with_extension("tmp");
     let data = serde_json::to_vec_pretty(&report).context("agent: failed to serialize report")?;
     fs::write(&tmp_path, data).with_context(|| {
@@ -337,6 +354,18 @@ struct CreateArgs {
     #[arg(long = "image-trace-backend", value_enum)]
     image_trace_backend: Option<TraceBackendArg>,
 
+    /// Path to the sidebundle agent binary to mount into containers
+    #[arg(long = "image-agent-bin", value_name = "PATH")]
+    image_agent_bin: Option<PathBuf>,
+
+    /// Override container engine command used for agent runs (e.g. "sudo -n docker")
+    #[arg(long = "image-agent-cli", value_name = "CMD")]
+    image_agent_cli: Option<String>,
+
+    /// Preserve agent output directories for debugging
+    #[arg(long = "image-agent-keep-output")]
+    image_agent_keep_output: bool,
+
     /// Fail the build when linker validation finds missing dependencies
     #[arg(long = "strict-validate")]
     strict_validate: bool,
@@ -368,6 +397,7 @@ enum TraceBackendArg {
     Ptrace,
     Fanotify,
     Combined,
+    Agent,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -531,7 +561,8 @@ fn build_image_closure(
     reference: &str,
     entries: &[ImageEntryArg],
     target: TargetTriple,
-    trace_backend: Option<TraceBackendKind>,
+    trace_backend: TraceBackendArg,
+    agent_launch: Option<&AgentLaunchConfig>,
 ) -> Result<ImageClosureResult> {
     if entries.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
@@ -542,7 +573,14 @@ fn build_image_closure(
     };
     let mut errors = Vec::new();
     for backend in attempts {
-        match build_with_backend(backend, reference, entries, target, trace_backend.clone()) {
+        match build_with_backend(
+            backend,
+            reference,
+            entries,
+            target,
+            trace_backend,
+            agent_launch,
+        ) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 errors.push(format!("{backend:?}: {err:?}"));
@@ -560,7 +598,8 @@ fn build_with_backend(
     reference: &str,
     entries: &[ImageEntryArg],
     target: TargetTriple,
-    trace_backend: Option<TraceBackendKind>,
+    trace_backend: TraceBackendArg,
+    agent_launch: Option<&AgentLaunchConfig>,
 ) -> Result<ImageClosureResult> {
     match backend {
         BackendPreference::Docker => {
@@ -569,12 +608,14 @@ fn build_with_backend(
                 .prepare_root(reference)
                 .with_context(|| "docker provider invocation failed")?;
             build_closure_from_root(
+                backend,
                 "docker",
                 reference,
                 target,
                 &root,
                 entries,
-                trace_backend.clone(),
+                trace_backend,
+                agent_launch,
             )
         }
         BackendPreference::Podman | BackendPreference::Auto => {
@@ -582,18 +623,29 @@ fn build_with_backend(
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            build_closure_from_root("podman", reference, target, &root, entries, trace_backend)
+            build_closure_from_root(
+                backend,
+                "podman",
+                reference,
+                target,
+                &root,
+                entries,
+                trace_backend,
+                agent_launch,
+            )
         }
     }
 }
 
 fn build_closure_from_root(
+    backend: BackendPreference,
     backend_name: &'static str,
     reference: &str,
     target: TargetTriple,
     root: &ImageRoot,
     entries: &[ImageEntryArg],
-    trace_backend: Option<TraceBackendKind>,
+    trace_backend: TraceBackendArg,
+    agent_launch: Option<&AgentLaunchConfig>,
 ) -> Result<ImageClosureResult> {
     let rootfs = root.rootfs().to_path_buf();
     let image_env = parse_image_env(&root.config().env);
@@ -627,7 +679,12 @@ fn build_closure_from_root(
     resolvers.insert(origin.clone(), chroot_resolver);
 
     let mut builder = ClosureBuilder::new().with_resolver_set(resolvers.clone());
-    if let Some(backend) = trace_backend {
+    if let Some(backend) = configure_image_trace_backend(
+        trace_backend,
+        backend,
+        reference,
+        agent_launch,
+    )? {
         let mut tracer = TraceCollector::new().with_backend(backend);
         if !image_env.is_empty() {
             tracer = tracer.with_env(image_env.clone());
@@ -684,6 +741,31 @@ fn strip_payload_prefix(path: &Path, prefix: &Path) -> PathBuf {
     }
 }
 
+fn configure_image_trace_backend(
+    arg: TraceBackendArg,
+    backend: BackendPreference,
+    reference: &str,
+    agent_launch: Option<&AgentLaunchConfig>,
+) -> Result<Option<TraceBackendKind>> {
+    match arg {
+        TraceBackendArg::Agent => {
+            let config = agent_launch
+                .ok_or_else(|| anyhow::anyhow!("image agent configuration missing"))?;
+            let runtime_cmd = config.command_for_backend(backend);
+            let engine = CliAgentEngine::new(
+                runtime_cmd,
+                reference.to_string(),
+                config.bin_path.clone(),
+                config.keep_output,
+            )?;
+            Ok(Some(
+                TraceBackendKind::Agent(AgentTraceBackend::new().with_engine(engine)),
+            ))
+        }
+        other => resolve_trace_backend(other),
+    }
+}
+
 fn resolve_trace_backend(arg: TraceBackendArg) -> Result<Option<TraceBackendKind>> {
     match arg {
         TraceBackendArg::Off => Ok(None),
@@ -727,7 +809,181 @@ fn resolve_trace_backend(arg: TraceBackendArg) -> Result<Option<TraceBackendKind
                 bail!("combined trace backend is only available on Linux");
             }
         }
+        TraceBackendArg::Agent => {
+            bail!("agent trace backend is only available for image inputs");
+        }
     }
+}
+
+fn parse_engine_command(value: &str) -> Result<Vec<OsString>> {
+    let parts = shell_words::split(value)
+        .map_err(|err| anyhow::anyhow!("invalid agent CLI command `{value}`: {err}"))?;
+    if parts.is_empty() {
+        bail!("agent CLI command cannot be empty");
+    }
+    Ok(parts.into_iter().map(OsString::from).collect())
+}
+
+#[derive(Clone)]
+struct AgentLaunchConfig {
+    bin_path: PathBuf,
+    keep_output: bool,
+    cli_override: Option<Vec<OsString>>,
+}
+
+impl AgentLaunchConfig {
+    fn from_args(
+        bin_override: Option<PathBuf>,
+        cli_override: Option<String>,
+        keep_output: bool,
+    ) -> Result<Self> {
+        let mut raw_path = if let Some(path) = bin_override {
+            path
+        } else {
+            env::current_exe().context("failed to locate sidebundle executable")?
+        };
+        if !raw_path.is_absolute() {
+            raw_path = env::current_dir()
+                .context("failed to resolve current directory for agent binary lookup")?
+                .join(raw_path);
+        }
+        let bin_path = fs::canonicalize(&raw_path).with_context(|| {
+            format!(
+                "failed to canonicalize image agent binary at {}",
+                raw_path.display()
+            )
+        })?;
+        let cli_override = match cli_override {
+            Some(spec) => Some(parse_engine_command(&spec)?),
+            None => None,
+        };
+        Ok(Self {
+            bin_path,
+            keep_output,
+            cli_override,
+        })
+    }
+
+    fn command_for_backend(&self, backend: BackendPreference) -> Vec<OsString> {
+        if let Some(cmd) = &self.cli_override {
+            return cmd.clone();
+        }
+        match backend {
+            BackendPreference::Podman | BackendPreference::Auto => vec![OsString::from("podman")],
+            _ => vec![OsString::from("docker")],
+        }
+    }
+}
+
+struct CliAgentEngine {
+    runtime_cmd: Vec<OsString>,
+    reference: String,
+    agent_bin: PathBuf,
+    keep_output: bool,
+}
+
+impl CliAgentEngine {
+    fn new(
+        runtime_cmd: Vec<OsString>,
+        reference: String,
+        agent_bin: PathBuf,
+        keep_output: bool,
+    ) -> Result<Self> {
+        if runtime_cmd.is_empty() {
+            bail!("agent runtime command cannot be empty");
+        }
+        Ok(Self {
+            runtime_cmd,
+            reference,
+            agent_bin,
+            keep_output,
+        })
+    }
+}
+
+impl AgentEngine for CliAgentEngine {
+    fn run(&self, spec: &TraceSpec) -> std::result::Result<TraceSpecReport, AgentEngineError> {
+        let spec_dir = TempDir::new().map_err(AgentEngineError::Io)?;
+        let out_dir = TempDir::new().map_err(AgentEngineError::Io)?;
+        let spec_path = spec_dir.path().join("spec.json");
+        let spec_data =
+            serde_json::to_vec_pretty(spec).map_err(AgentEngineError::Serialization)?;
+        fs::write(&spec_path, spec_data).map_err(AgentEngineError::Io)?;
+
+        let mut command = Command::new(&self.runtime_cmd[0]);
+        for arg in &self.runtime_cmd[1..] {
+            command.arg(arg);
+        }
+        command
+            .arg("run")
+            .arg("--rm")
+            .arg("--cap-add")
+            .arg("SYS_PTRACE")
+            .arg("--security-opt")
+            .arg("seccomp=unconfined")
+            .arg("--pids-limit")
+            .arg("0")
+            .arg("--network")
+            .arg("none")
+            .arg("--entrypoint")
+            .arg("/sb/agent")
+            .arg("-v")
+            .arg(bind_mount_arg(&self.agent_bin, "/sb/agent", "ro"))
+            .arg("-v")
+            .arg(bind_mount_arg(spec_dir.path(), "/sb-in", "ro"))
+            .arg("-v")
+            .arg(bind_mount_arg(out_dir.path(), "/sb-out", "rw"))
+            .arg(&self.reference)
+            .arg("agent")
+            .arg("trace")
+            .arg("--rootfs")
+            .arg("/")
+            .arg("--spec")
+            .arg("/sb-in/spec.json")
+            .arg("--output")
+            .arg("/sb-out")
+            .arg("--trace-backend")
+            .arg("ptrace");
+        debug!(
+            "spawning agent trace container for `{}` via {:?}",
+            self.reference, self.runtime_cmd
+        );
+        let status = command
+            .status()
+            .map_err(|err| AgentEngineError::Failure(format!("failed to invoke agent runtime: {err}")))?;
+        if !status.success() {
+            return Err(AgentEngineError::Failure(format!(
+                "agent container for `{}` exited with status {status}",
+                self.reference
+            )));
+        }
+        let report_path = out_dir.path().join("report.json");
+        let data = fs::read(&report_path).map_err(AgentEngineError::Io)?;
+        let report =
+            serde_json::from_slice(&data).map_err(AgentEngineError::Serialization)?;
+        if self.keep_output {
+            #[allow(deprecated)]
+            let preserved = out_dir.into_path();
+            info!(
+                "agent trace output for image `{}` preserved at {}",
+                self.reference,
+                preserved.display()
+            );
+        }
+        Ok(report)
+    }
+}
+
+fn bind_mount_arg(source: &Path, target: &str, mode: &str) -> OsString {
+    let mut value = OsString::new();
+    value.push(source.as_os_str());
+    value.push(":");
+    value.push(target);
+    if !mode.is_empty() {
+        value.push(":");
+        value.push(mode);
+    }
+    value
 }
 
 fn log_closure_stats(label: &str, closure: &DependencyClosure) {
