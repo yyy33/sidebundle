@@ -1228,6 +1228,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "sidebundle-closure",
  "sidebundle-core",
@@ -1267,6 +1268,7 @@ name = "sidebundle-packager"
 version = "0.1.0"
 dependencies = [
  "log",
+ "nix",
  "pathdiff",
  "serde",
  "serde_json",

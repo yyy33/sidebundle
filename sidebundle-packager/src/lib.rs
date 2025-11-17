@@ -1,25 +1,31 @@
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use pathdiff::diff_paths;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sidebundle_core::{BundleSpec, DependencyClosure, EntryBundlePlan};
+use sidebundle_core::{BundleSpec, DependencyClosure, TracedFile};
 use thiserror::Error;
+
+mod launcher;
+use launcher::write_launchers;
 
 /// Writes the dependency closure to disk and generates launchers.
 #[derive(Debug, Clone)]
 pub struct Packager {
     output_root: PathBuf,
+    copy_system_assets: bool,
 }
 
 impl Default for Packager {
     fn default() -> Self {
         Self {
             output_root: PathBuf::from("target/bundles"),
+            copy_system_assets: true,
         }
     }
 }
@@ -31,6 +37,12 @@ impl Packager {
 
     pub fn with_output_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.output_root = root.into();
+        self
+    }
+
+    /// Enable or disable copying of system config assets (/etc/passwd, etc.).
+    pub fn with_system_assets(mut self, enabled: bool) -> Self {
+        self.copy_system_assets = enabled;
         self
     }
 
@@ -62,8 +74,34 @@ impl Packager {
         })?;
 
         let mut manifest_files = Vec::new();
+        let mut alias_map: HashMap<PathBuf, Vec<PathBuf>> = closure.runtime_aliases.clone();
+        for traced in &closure.traced_files {
+            alias_map
+                .entry(traced.resolved.clone())
+                .or_default()
+                .push(traced.original.clone());
+        }
+        let host_assets = if self.copy_system_assets {
+            collect_host_system_assets()
+        } else {
+            HashMap::new()
+        };
+        let traced_queue: Vec<TracedFile> = closure.traced_files.clone();
 
         for file in &closure.files {
+            if !file.source.exists() {
+                warn!(
+                    "packager: source file {} missing; bundle path {}",
+                    file.source.display(),
+                    file.destination.display()
+                );
+            } else {
+                debug!(
+                    "packager: staging {} -> {}",
+                    file.source.display(),
+                    file.destination.display()
+                );
+            }
             let stored = store_in_data(&data_dir, &file.source, &file.digest)?;
 
             let dest_path = bundle_root.join(&file.destination);
@@ -74,45 +112,84 @@ impl Packager {
                 destination: file.destination.clone(),
                 digest: file.digest.clone(),
             });
+            if let Some(runtime_aliases) = alias_map.remove(&file.source) {
+                let canonical_abs = bundle_root.join(&file.destination);
+                for runtime in runtime_aliases {
+                    let alias_rel = payload_alias_destination(&runtime);
+                    if alias_rel == file.destination {
+                        continue;
+                    }
+                    let alias_abs = bundle_root.join(&alias_rel);
+                    if alias_abs.exists() {
+                        fs::remove_file(&alias_abs).map_err(|source| PackagerError::Io {
+                            path: alias_abs.clone(),
+                            source,
+                        })?;
+                    }
+                    if let Some(parent) = alias_abs.parent() {
+                        fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+                            path: parent.to_path_buf(),
+                            source,
+                        })?;
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::symlink;
+                        if let Some(parent) = alias_abs.parent() {
+                            if let Some(relative) = diff_paths(&canonical_abs, parent) {
+                                if symlink(&relative, &alias_abs).is_ok() {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    fs::copy(&canonical_abs, &alias_abs).map_err(|source| PackagerError::Io {
+                        path: alias_abs.clone(),
+                        source,
+                    })?;
+                    copy_permissions(&canonical_abs, &alias_abs).ok();
+                    debug!(
+                        "packager: aliasing {} -> {}",
+                        canonical_abs.display(),
+                        alias_abs.display()
+                    );
+                }
+            }
         }
 
-        for plan in &closure.entry_plans {
-            let launcher_path = bundle_root.join("bin").join(&plan.display_name);
-            if let Some(parent) = launcher_path.parent() {
-                fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
-            }
-            let mut file = File::create(&launcher_path).map_err(|source| PackagerError::Io {
-                path: launcher_path.clone(),
-                source,
-            })?;
-            file.write_all(render_launcher(plan).as_bytes())
-                .map_err(|source| PackagerError::Io {
-                    path: launcher_path.clone(),
-                    source,
-                })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&launcher_path)
-                    .map_err(|source| PackagerError::Io {
-                        path: launcher_path.clone(),
-                        source,
-                    })?
-                    .permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&launcher_path, perms).map_err(|source| PackagerError::Io {
-                    path: launcher_path.clone(),
-                    source,
-                })?;
-            }
+        for (missing_source, aliases) in alias_map {
+            warn!(
+                "packager: traced source {} missing for runtime paths {:?}",
+                missing_source.display(),
+                aliases
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+            );
         }
+
+        write_launchers(&bundle_root, &closure.entry_plans)?;
 
         let mut traced_manifest = Vec::new();
-        for traced in &closure.traced_files {
-            match fs::metadata(&traced.resolved) {
+        for traced in &traced_queue {
+            let mut source_path = traced.resolved.clone();
+            if !source_path.exists() {
+                if let Some(host_path) = host_assets.get(&traced.original) {
+                    debug!(
+                        "packager: using host asset {} for runtime {}",
+                        host_path.display(),
+                        traced.original.display()
+                    );
+                    source_path = host_path.clone();
+                }
+            } else {
+                debug!(
+                    "packager: staging traced {} (runtime {})",
+                    source_path.display(),
+                    traced.original.display()
+                );
+            }
+            match fs::metadata(&source_path) {
                 Ok(meta) if meta.is_file() => {}
                 Ok(_) => {
                     warn!(
@@ -129,8 +206,8 @@ impl Packager {
                     continue;
                 }
             }
-            let digest = compute_digest(&traced.resolved)?;
-            let stored = store_in_data(&data_dir, &traced.resolved, &digest)?;
+            let digest = compute_digest(&source_path)?;
+            let stored = store_in_data(&data_dir, &source_path, &digest)?;
             let destination = traced_destination(&traced.original);
             let dest_path = bundle_root.join(&destination);
             link_or_copy(&stored, &dest_path)?;
@@ -141,6 +218,8 @@ impl Packager {
                 digest,
             });
         }
+
+        ensure_device_nodes(&bundle_root)?;
 
         write_manifest(
             &bundle_root,
@@ -159,95 +238,6 @@ impl Packager {
         );
         Ok(bundle_root)
     }
-}
-
-fn render_launcher(plan: &EntryBundlePlan) -> String {
-    let binary_ref = format!("${{BUNDLE_ROOT}}/{}", plan.binary_destination.display());
-    if !plan.requires_linker {
-        return format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUNDLE_ROOT="$(cd "${{SCRIPT_DIR}}/.." && pwd)"
-export SIDEBUNDLE_ROOT="${{BUNDLE_ROOT}}"
-
-fail() {{
-    echo "sidebundle launcher: $1" >&2
-    exit 1
-}}
-
-BINARY="{binary}"
-if [[ ! -x "${{BINARY}}" ]]; then
-    fail "entry binary missing or not executable: ${{BINARY}}"
-fi
-exec "${{BINARY}}" "$@"
-"#,
-            binary = binary_ref
-        );
-    }
-
-    let linker_ref = format!("${{BUNDLE_ROOT}}/{}", plan.linker_destination.display());
-    let mut lib_dirs: Vec<String> = plan
-        .library_dirs
-        .iter()
-        .map(|dir| format!("${{BUNDLE_ROOT}}/{}", dir.display()))
-        .collect();
-    if lib_dirs.is_empty() {
-        if let Some(dir) = plan.binary_destination.parent() {
-            lib_dirs.push(format!("${{BUNDLE_ROOT}}/{}", dir.display()));
-        }
-    }
-    let joined = lib_dirs.join(":");
-
-    format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUNDLE_ROOT="$(cd "${{SCRIPT_DIR}}/.." && pwd)"
-export SIDEBUNDLE_ROOT="${{BUNDLE_ROOT}}"
-
-fail() {{
-    echo "sidebundle launcher: $1" >&2
-    exit 1
-}}
-
-LINKER="{linker}"
-BINARY="{binary}"
-LIB_PATH="{lib_path}"
-
-if [[ ! -x "${{LINKER}}" ]]; then
-    fail "linker missing or not executable: ${{LINKER}}"
-fi
-if [[ ! -x "${{BINARY}}" ]]; then
-    fail "entry binary missing or not executable: ${{BINARY}}"
-fi
-
-IFS=':' read -r -a __libdirs <<< "${{LIB_PATH}}"
-for dir in "${{__libdirs[@]}}"; do
-    if [[ -z "${{dir}}" ]]; then
-        continue
-    fi
-    if [[ ! -d "${{dir}}" ]]; then
-        echo "sidebundle launcher: warning: library directory missing: ${{dir}}" >&2
-    fi
-done
-
-ORIGINAL_LD_LIBRARY_PATH="${{LD_LIBRARY_PATH:-}}"
-if [[ -n "${{ORIGINAL_LD_LIBRARY_PATH}}" ]]; then
-    export LD_LIBRARY_PATH="${{LIB_PATH}}:${{ORIGINAL_LD_LIBRARY_PATH}}"
-else
-    export LD_LIBRARY_PATH="${{LIB_PATH}}"
-fi
-unset LD_PRELOAD
-
-exec "${{LINKER}}" --library-path "${{LIB_PATH}}" "${{BINARY}}" "$@"
-"#,
-        linker = linker_ref,
-        binary = binary_ref,
-        lib_path = joined
-    )
 }
 
 #[derive(Debug, Error)]
@@ -388,6 +378,117 @@ fn traced_destination(path: &Path) -> PathBuf {
     dest
 }
 
+fn payload_alias_destination(path: &Path) -> PathBuf {
+    let mut dest = PathBuf::from("payload");
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                dest = PathBuf::from("payload");
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                if dest != Path::new("payload") {
+                    dest.pop();
+                }
+            }
+            Component::Normal(part) => dest.push(part),
+            Component::Prefix(_) => dest.push(component.as_os_str()),
+        }
+    }
+    dest
+}
+
+fn collect_host_system_assets() -> HashMap<PathBuf, PathBuf> {
+    let mut map = HashMap::new();
+    let candidates = [
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/ld.so.cache",
+    ];
+    for path in candidates {
+        let host_path = PathBuf::from(path);
+        if host_path.exists() {
+            map.insert(PathBuf::from(path), host_path);
+        }
+    }
+    map
+}
+
+struct DeviceNodeSpec {
+    rel_path: &'static str,
+    major: u64,
+    minor: u64,
+    mode: u32,
+}
+
+fn ensure_device_nodes(bundle_root: &Path) -> Result<(), PackagerError> {
+    const DEVICES: &[DeviceNodeSpec] = &[
+        DeviceNodeSpec {
+            rel_path: "payload/dev/null",
+            major: 1,
+            minor: 3,
+            mode: 0o666,
+        },
+        DeviceNodeSpec {
+            rel_path: "payload/dev/tty",
+            major: 5,
+            minor: 0,
+            mode: 0o666,
+        },
+    ];
+
+    for spec in DEVICES {
+        let dest = bundle_root.join(spec.rel_path);
+        if dest.exists() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        match create_device_node(&dest, spec.major, spec.minor, spec.mode) {
+            Ok(()) => {
+                debug!("created device node {}", dest.display());
+            }
+            Err(err) => {
+                warn!(
+                    "failed to create device {} via mknod ({}); writing stub file",
+                    dest.display(),
+                    err
+                );
+                File::create(&dest).map_err(|source| PackagerError::Io {
+                    path: dest.clone(),
+                    source,
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_device_node(path: &Path, major: u64, minor: u64, mode: u32) -> io::Result<()> {
+    use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+
+    let dev = makedev(major, minor);
+    let mode = Mode::from_bits_truncate(mode);
+    mknod(path, SFlag::S_IFCHR, mode, dev)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+}
+
+#[cfg(not(unix))]
+fn create_device_node(_path: &Path, _major: u64, _minor: u64, _mode: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "device nodes are unsupported on this platform",
+    ))
+}
+
 fn write_manifest(bundle_root: &Path, manifest: Manifest) -> Result<(), PackagerError> {
     let manifest_path = bundle_root.join("manifest.lock");
     let mut file = File::create(&manifest_path).map_err(|source| PackagerError::Io {
@@ -416,24 +517,4 @@ mod tests {
         assert!(packager.emit(&spec, &closure).is_err());
     }
 
-    #[test]
-    fn render_launcher_contains_paths() {
-        let plan = EntryBundlePlan {
-            display_name: "echo".into(),
-            binary_source: PathBuf::from("/bin/echo"),
-            binary_destination: PathBuf::from("payload/bin/echo"),
-            linker_source: PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
-            linker_destination: PathBuf::from("payload/lib64/ld-linux-x86-64.so.2"),
-            library_dirs: vec![PathBuf::from("payload/lib64")],
-            requires_linker: true,
-        };
-        let content = render_launcher(&plan);
-        assert!(content.contains("payload/bin/echo"));
-        assert!(content.contains("--library-path"));
-        assert!(content.contains("LD_LIBRARY_PATH"));
-        assert!(content.contains("unset LD_PRELOAD"));
-        assert!(content.contains("SIDEBUNDLE_ROOT"));
-        assert!(content.contains("sidebundle launcher"));
-        assert!(content.contains("linker missing or not executable"));
-    }
 }

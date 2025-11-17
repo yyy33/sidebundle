@@ -1,28 +1,32 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
+use serde::Deserialize;
 use log::{debug, info, warn, LevelFilter};
+use sha2::{Digest, Sha256};
 use shell_words;
 use sidebundle_closure::{
-    image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
+    image::{DockerProvider, ImageConfig, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{
-        AgentEngine, AgentEngineError, AgentTraceBackend, TraceBackendKind, TraceCollector,
-        TraceCommand as RuntimeTraceCommand, TraceSpec, TraceSpecReport, TRACE_REPORT_VERSION,
+        AgentTraceCommand, TraceBackendKind, TraceCollector, TraceCommand as RuntimeTraceCommand,
+        TraceSpec, TraceSpecReport, TRACE_REPORT_VERSION,
     },
     validator::{BundleValidator, EntryValidationStatus, LinkerFailure, ValidationReport},
-    ChrootPathResolver, ClosureBuilder, ResolverSet,
+    ChrootPathResolver, ClosureBuilder, PathResolver, ResolverSet,
 };
 use sidebundle_core::{
-    BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, TargetTriple,
+    BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, ResolvedFile,
+    TargetTriple,
 };
 use sidebundle_packager::Packager;
 use tempfile::TempDir;
@@ -133,10 +137,13 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         .build(&spec)
         .context("failed to build dependency closure")?;
     log_closure_stats("host inputs", &closure);
+    let mut resolver_entries: Vec<(Origin, Arc<dyn PathResolver>)> = Vec::new();
+    if let Some(resolver) = host_resolvers.get(&Origin::Host) {
+        resolver_entries.push((Origin::Host, resolver));
+    }
 
     let default_backend = BackendPreference::from(image_backend);
     let grouped = group_image_entries(&from_image, default_backend)?;
-    let mut _resolver_guards = Vec::new();
     for ((preference, reference), entries) in grouped {
         info!(
             "constructing closure for image `{}` via {:?} backend ({} entr{} )",
@@ -159,8 +166,11 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         log_closure_stats(&format!("image `{reference}`"), &image_result.closure);
         let report = closure.merge(image_result.closure);
         log_merge_report(&reference, &report);
-        _resolver_guards.push(image_result.resolvers);
+        resolver_entries.extend(image_result.resolver_entries);
     }
+
+    ensure_system_assets(&mut closure, &resolver_entries)
+        .context("failed to backfill system assets")?;
 
     if closure.entry_plans.is_empty() {
         bail!("no executable entries were collected from host or image inputs");
@@ -551,10 +561,278 @@ fn group_image_entries(
     Ok(map)
 }
 
+fn ensure_system_assets(
+    closure: &mut DependencyClosure,
+    resolvers: &[(Origin, Arc<dyn PathResolver>)],
+) -> Result<()> {
+    let mut existing: HashSet<PathBuf> =
+        closure.files.iter().map(|file| file.destination.clone()).collect();
+    for (origin, resolver) in resolvers {
+        if !matches!(origin, Origin::Image(_)) {
+            continue;
+        }
+        for asset in SYSTEM_ASSET_PATHS {
+            let logical = LogicalPath::new(origin.clone(), PathBuf::from(asset));
+            let candidate = resolver.to_host(&logical);
+            match fs::metadata(&candidate) {
+                Ok(meta) if meta.is_file() => {}
+                _ => continue,
+            }
+            let destination = payload_path_for(logical.path());
+            if existing.contains(&destination) {
+                continue;
+            }
+            let digest = compute_digest(&candidate).with_context(|| {
+                format!(
+                    "failed to hash system asset {} (origin {:?})",
+                    candidate.display(),
+                    origin
+                )
+            })?;
+            debug!(
+                "system asset {} resolved to {} for {:?}",
+                asset,
+                candidate.display(),
+                origin
+            );
+            closure.files.push(ResolvedFile {
+                source: candidate.clone(),
+                destination: destination.clone(),
+                digest,
+            });
+            existing.insert(destination);
+        }
+    }
+    backfill_glibc_hwcaps(closure, resolvers, &mut existing)
+}
+
+fn payload_path_for(path: &Path) -> PathBuf {
+    let mut dest = PathBuf::from("payload");
+    if path.is_absolute() {
+        for component in path.components().skip(1) {
+            dest.push(component.as_os_str());
+        }
+    } else {
+        dest.push(path);
+    }
+    dest
+}
+
+fn compute_digest(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn backfill_glibc_hwcaps(
+    closure: &mut DependencyClosure,
+    resolvers: &[(Origin, Arc<dyn PathResolver>)],
+    existing: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for (origin, resolver) in resolvers {
+        if let Origin::Image(_) = origin {
+            copy_lib64_aliases(origin.clone(), resolver.as_ref(), existing)?;
+            discover_hwcaps(closure, origin.clone(), resolver.as_ref(), existing)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_lib64_aliases(
+    origin: Origin,
+    resolver: &dyn PathResolver,
+    existing: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    const ALIASES: &[(&str, &str)] = &[
+        ("/lib64", "/lib"),
+        ("/usr/lib64", "/usr/lib"),
+        ("/lib64", "/usr/lib"),
+    ];
+    for (link, target) in ALIASES {
+        let logical_link = LogicalPath::new(origin.clone(), PathBuf::from(link));
+        let host_link = resolver.to_host(&logical_link);
+        if let Ok(meta) = fs::symlink_metadata(&host_link) {
+            if meta.file_type().is_symlink() {
+                let destination = payload_path_for(logical_link.path());
+                copy_symlink(&host_link, &destination, existing)?;
+                continue;
+            }
+            if meta.is_dir() {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let logical_target = LogicalPath::new(origin.clone(), PathBuf::from(target));
+        let host_target = resolver.to_host(&logical_target);
+        if fs::metadata(&host_target).is_ok() {
+            let destination = payload_path_for(logical_link.path());
+            if destination.exists() {
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent for {}", destination.display())
+                })?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink(Path::new(target), &destination).with_context(|| {
+                    format!("failed to create lib64 symlink {}", destination.display())
+                })?;
+            }
+            existing.insert(destination);
+        }
+    }
+    Ok(())
+}
+
+fn discover_hwcaps(
+    closure: &mut DependencyClosure,
+    origin: Origin,
+    resolver: &dyn PathResolver,
+    existing: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let mut stack = Vec::new();
+    for dir in GLIBC_HWCAPS_DIRS {
+        let logical = LogicalPath::new(origin.clone(), PathBuf::from(dir));
+        let host = resolver.to_host(&logical);
+        if let Ok(meta) = fs::symlink_metadata(&host) {
+            if meta.is_dir() {
+                stack.push((host, logical.path().to_path_buf()));
+            } else if meta.file_type().is_symlink() {
+                if let Ok(target) = fs::read_link(&host) {
+                    let dest = payload_path_for(logical.path());
+                    copy_symlink(&host, &dest, existing)?;
+                    let resolved = resolver.to_host(&LogicalPath::new(origin.clone(), target));
+                    stack.push((resolved, logical.path().to_path_buf()));
+                }
+                continue;
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        }
+    }
+    while let Some((host_path, logical_path)) = stack.pop() {
+        let entries = match fs::read_dir(&host_path) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!(
+                    "failed to read glibc-hwcaps dir {}: {err}",
+                    host_path.display()
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    warn!("failed to enumerate dir: {err}");
+                    continue;
+                }
+            };
+            let host_entry = entry.path();
+            let logical_entry = logical_path.join(entry.file_name());
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    stack.push((host_entry, logical_entry));
+                }
+                Ok(ft) if ft.is_file() || ft.is_symlink() => {
+                    let destination = payload_path_for(&logical_entry);
+                    if existing.contains(&destination) {
+                        continue;
+                    }
+                    let digest = compute_digest(&host_entry).with_context(|| {
+                        format!(
+                            "failed to hash glibc-hwcaps file {}",
+                            host_entry.display()
+                        )
+                    })?;
+                    debug!(
+                        "adding glibc-hwcaps {} -> {}",
+                        host_entry.display(),
+                        destination.display()
+                    );
+                    closure.files.push(ResolvedFile {
+                        source: host_entry.clone(),
+                        destination: destination.clone(),
+                        digest,
+                    });
+                    existing.insert(destination);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_symlink(source: &Path, destination: &Path, existing: &mut HashSet<PathBuf>) -> Result<()> {
+    if existing.contains(destination) {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create glibc-hwcaps parent {}", parent.display())
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        if destination.exists() {
+            fs::remove_file(destination).ok();
+        }
+        let target = fs::read_link(source).with_context(|| {
+            format!("failed to read hwcaps symlink {}", source.display())
+        })?;
+        symlink(&target, destination).with_context(|| {
+            format!("failed to write hwcaps symlink {}", destination.display())
+        })?;
+    }
+    existing.insert(destination.to_path_buf());
+    Ok(())
+}
+
 struct ImageClosureResult {
     closure: DependencyClosure,
-    resolvers: ResolverSet,
+    resolver_entries: Vec<(Origin, Arc<dyn PathResolver>)>,
 }
+
+const SYSTEM_ASSET_PATHS: &[&str] = &[
+    "/etc/ld.so.cache",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/nsswitch.conf",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+];
+
+const GLIBC_HWCAPS_DIRS: &[&str] = &[
+    "/lib/glibc-hwcaps",
+    "/lib64/glibc-hwcaps",
+    "/lib/x86_64-linux-gnu/glibc-hwcaps",
+    "/lib64/x86_64-linux-gnu/glibc-hwcaps",
+    "/usr/lib/glibc-hwcaps",
+    "/usr/lib/x86_64-linux-gnu/glibc-hwcaps",
+    "/usr/lib64/glibc-hwcaps",
+    "/usr/lib64/x86_64-linux-gnu/glibc-hwcaps",
+    "/usr/bin/glibc-hwcaps",
+];
 
 fn build_image_closure(
     preference: BackendPreference,
@@ -567,6 +845,26 @@ fn build_image_closure(
     if entries.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
     }
+    if matches!(trace_backend, TraceBackendArg::Agent) {
+        let launch = agent_launch
+            .ok_or_else(|| anyhow::anyhow!("agent backend requires --image-agent-* options"))?;
+        let attempts: Vec<BackendPreference> = match preference {
+            BackendPreference::Auto => vec![BackendPreference::Docker, BackendPreference::Podman],
+            other => vec![other],
+        };
+        let mut errors = Vec::new();
+        for backend in attempts {
+            match build_agent_image_closure(backend, reference, entries, target, launch) {
+                Ok(result) => return Ok(result),
+                Err(err) => errors.push(format!("{backend:?}: {err:?}")),
+            }
+        }
+        bail!(
+            "agent backend failed for `{reference}` via all runtimes:\n{}",
+            errors.join("\n")
+        );
+    }
+
     let attempts: Vec<BackendPreference> = match preference {
         BackendPreference::Auto => vec![BackendPreference::Docker, BackendPreference::Podman],
         other => vec![other],
@@ -582,9 +880,7 @@ fn build_image_closure(
             agent_launch,
         ) {
             Ok(result) => return Ok(result),
-            Err(err) => {
-                errors.push(format!("{backend:?}: {err:?}"));
-            }
+            Err(err) => errors.push(format!("{backend:?}: {err:?}")),
         }
     }
     bail!(
@@ -616,6 +912,7 @@ fn build_with_backend(
                 entries,
                 trace_backend,
                 agent_launch,
+                None,
             )
         }
         BackendPreference::Podman | BackendPreference::Auto => {
@@ -632,9 +929,72 @@ fn build_with_backend(
                 entries,
                 trace_backend,
                 agent_launch,
+                None,
             )
         }
     }
+}
+
+fn build_agent_image_closure(
+    backend: BackendPreference,
+    reference: &str,
+    entries: &[ImageEntryArg],
+    target: TargetTriple,
+    launch: &AgentLaunchConfig,
+) -> Result<ImageClosureResult> {
+    let backend_name = match backend {
+        BackendPreference::Docker => "docker",
+        BackendPreference::Podman => "podman",
+        BackendPreference::Auto => unreachable!("auto preference should be resolved earlier"),
+    };
+    let runner = AgentTraceRunner::new(
+        launch.command_for_backend(backend),
+        launch.bin_path.clone(),
+        launch.keep_output,
+    )?;
+    debug!(
+        "agent: launching container backed by {:?} for `{}`",
+        backend, reference
+    );
+    let run_result = runner.run(reference, entries)?;
+    debug!(
+        "agent: trace for `{}` captured {} file(s); exported rootfs at {}",
+        reference,
+        run_result.report.files.len(),
+        run_result.rootfs.path().display()
+    );
+    for entry in entries {
+        let host_path = physical_image_path(run_result.rootfs.path(), &entry.path);
+        if let Err(err) = std::fs::metadata(&host_path) {
+            warn!(
+                "agent: entry {} missing from exported rootfs at {} ({err})",
+                entry.path.display(),
+                host_path.display()
+            );
+        } else {
+            debug!(
+                "agent: entry {} resolved to {}",
+                entry.path.display(),
+                host_path.display()
+            );
+        }
+    }
+    let export_guard = run_result.rootfs;
+    let export_path = export_guard.path().to_path_buf();
+    let config = run_result.config.clone();
+    let mut image_root = ImageRoot::new(reference, export_path, config);
+    image_root = image_root.with_cleanup(move || drop(export_guard));
+    build_closure_from_root(
+        backend,
+        backend_name,
+        reference,
+        target,
+        &image_root,
+        entries,
+        TraceBackendArg::Off,
+        None,
+        Some(run_result.report.files),
+    )
 }
 
 fn build_closure_from_root(
@@ -646,6 +1006,7 @@ fn build_closure_from_root(
     entries: &[ImageEntryArg],
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
+    external_traces: Option<Vec<PathBuf>>,
 ) -> Result<ImageClosureResult> {
     let rootfs = root.rootfs().to_path_buf();
     let image_env = parse_image_env(&root.config().env);
@@ -676,9 +1037,12 @@ fn build_closure_from_root(
 
     let mut resolvers = ResolverSet::new();
     let chroot_resolver = Arc::new(ChrootPathResolver::from_image(root.clone(), origin.clone()));
-    resolvers.insert(origin.clone(), chroot_resolver);
+    resolvers.insert(origin.clone(), chroot_resolver.clone());
 
     let mut builder = ClosureBuilder::new().with_resolver_set(resolvers.clone());
+    if let Some(paths) = external_traces {
+        builder = builder.with_external_trace_paths(origin.clone(), paths);
+    }
     if let Some(backend) = configure_image_trace_backend(
         trace_backend,
         backend,
@@ -692,11 +1056,13 @@ fn build_closure_from_root(
         builder = builder.with_tracer(tracer);
     }
 
-    let mut closure = builder
+    let closure = builder
         .build(&spec)
         .with_context(|| format!("failed to build closure inside image `{reference}`"))?;
-    normalize_image_closure(&mut closure, &rootfs);
-    Ok(ImageClosureResult { closure, resolvers })
+    Ok(ImageClosureResult {
+        closure,
+        resolver_entries: vec![(origin, chroot_resolver)],
+    })
 }
 
 fn physical_image_path(rootfs: &Path, virtual_path: &Path) -> PathBuf {
@@ -707,60 +1073,41 @@ fn physical_image_path(rootfs: &Path, virtual_path: &Path) -> PathBuf {
     rootfs.join(relative)
 }
 
-fn normalize_image_closure(closure: &mut DependencyClosure, rootfs: &Path) {
-    let mut prefix = PathBuf::from("payload");
-    for component in rootfs.components() {
-        if let Component::Normal(part) = component {
-            prefix.push(part);
-        }
-    }
-    if prefix == Path::new("payload") {
-        return;
-    }
-    for file in &mut closure.files {
-        file.destination = strip_payload_prefix(&file.destination, &prefix);
-    }
-    for plan in &mut closure.entry_plans {
-        plan.binary_destination = strip_payload_prefix(&plan.binary_destination, &prefix);
-        plan.linker_destination = strip_payload_prefix(&plan.linker_destination, &prefix);
-        plan.library_dirs = plan
-            .library_dirs
+fn build_agent_trace_spec(entries: &[ImageEntryArg], config: &ImageConfig) -> TraceSpec {
+    let mut spec = TraceSpec::new();
+    if !config.env.is_empty() {
+        spec.env = config
+            .env
             .iter()
-            .map(|dir| strip_payload_prefix(dir, &prefix))
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
     }
-}
-
-fn strip_payload_prefix(path: &Path, prefix: &Path) -> PathBuf {
-    if let Ok(stripped) = path.strip_prefix(prefix) {
-        let mut new_path = PathBuf::from("payload");
-        new_path.push(stripped);
-        new_path
-    } else {
-        path.to_path_buf()
+    for entry in entries {
+        let mut argv = vec![entry.path.display().to_string()];
+        if let Some(args) = &entry.trace_args {
+            argv.extend(args.clone());
+        }
+        spec.commands.push(AgentTraceCommand {
+            argv,
+            cwd: config.workdir.as_ref().map(|p| p.clone()),
+        });
     }
+    spec
 }
 
 fn configure_image_trace_backend(
     arg: TraceBackendArg,
-    backend: BackendPreference,
-    reference: &str,
+    _backend: BackendPreference,
+    _reference: &str,
     agent_launch: Option<&AgentLaunchConfig>,
 ) -> Result<Option<TraceBackendKind>> {
     match arg {
         TraceBackendArg::Agent => {
-            let config = agent_launch
-                .ok_or_else(|| anyhow::anyhow!("image agent configuration missing"))?;
-            let runtime_cmd = config.command_for_backend(backend);
-            let engine = CliAgentEngine::new(
-                runtime_cmd,
-                reference.to_string(),
-                config.bin_path.clone(),
-                config.keep_output,
-            )?;
-            Ok(Some(
-                TraceBackendKind::Agent(AgentTraceBackend::new().with_engine(engine)),
-            ))
+            let _ = agent_launch.ok_or_else(|| {
+                anyhow::anyhow!("--image-agent-bin/cli must be provided when using agent backend")
+            })?;
+            bail!("agent trace backend is handled separately for image inputs")
         }
         other => resolve_trace_backend(other),
     }
@@ -875,48 +1222,45 @@ impl AgentLaunchConfig {
     }
 }
 
-struct CliAgentEngine {
+struct AgentRunResult {
+    report: TraceSpecReport,
+    rootfs: TempDir,
+    config: ImageConfig,
+}
+
+struct AgentTraceRunner {
     runtime_cmd: Vec<OsString>,
-    reference: String,
     agent_bin: PathBuf,
     keep_output: bool,
 }
 
-impl CliAgentEngine {
-    fn new(
-        runtime_cmd: Vec<OsString>,
-        reference: String,
-        agent_bin: PathBuf,
-        keep_output: bool,
-    ) -> Result<Self> {
-        if runtime_cmd.is_empty() {
+impl AgentTraceRunner {
+    fn new(cmd: Vec<OsString>, agent_bin: PathBuf, keep_output: bool) -> Result<Self> {
+        if cmd.is_empty() {
             bail!("agent runtime command cannot be empty");
         }
         Ok(Self {
-            runtime_cmd,
-            reference,
+            runtime_cmd: cmd,
             agent_bin,
             keep_output,
         })
     }
-}
 
-impl AgentEngine for CliAgentEngine {
-    fn run(&self, spec: &TraceSpec) -> std::result::Result<TraceSpecReport, AgentEngineError> {
-        let spec_dir = TempDir::new().map_err(AgentEngineError::Io)?;
-        let out_dir = TempDir::new().map_err(AgentEngineError::Io)?;
-        let spec_path = spec_dir.path().join("spec.json");
-        let spec_data =
-            serde_json::to_vec_pretty(spec).map_err(AgentEngineError::Serialization)?;
-        fs::write(&spec_path, spec_data).map_err(AgentEngineError::Io)?;
+    fn run(&self, reference: &str, entries: &[ImageEntryArg]) -> Result<AgentRunResult> {
+        let spec_dir = TempDir::new().context("failed to create agent spec dir")?;
+        let out_dir = TempDir::new().context("failed to create agent output dir")?;
+        let export_dir = TempDir::new().context("failed to create agent rootfs dir")?;
 
-        let mut command = Command::new(&self.runtime_cmd[0]);
-        for arg in &self.runtime_cmd[1..] {
-            command.arg(arg);
-        }
-        command
-            .arg("run")
-            .arg("--rm")
+        let container_name = format!(
+            "sidebundle-agent-{}-{}",
+            sanitize_reference(reference),
+            current_millis()
+        );
+        let mut create_cmd = self.base_command();
+        create_cmd
+            .arg("create")
+            .arg("--name")
+            .arg(&container_name)
             .arg("--cap-add")
             .arg("SYS_PTRACE")
             .arg("--security-opt")
@@ -933,7 +1277,7 @@ impl AgentEngine for CliAgentEngine {
             .arg(bind_mount_arg(spec_dir.path(), "/sb-in", "ro"))
             .arg("-v")
             .arg(bind_mount_arg(out_dir.path(), "/sb-out", "rw"))
-            .arg(&self.reference)
+            .arg(reference)
             .arg("agent")
             .arg("trace")
             .arg("--rootfs")
@@ -944,33 +1288,135 @@ impl AgentEngine for CliAgentEngine {
             .arg("/sb-out")
             .arg("--trace-backend")
             .arg("ptrace");
-        debug!(
-            "spawning agent trace container for `{}` via {:?}",
-            self.reference, self.runtime_cmd
-        );
-        let status = command
-            .status()
-            .map_err(|err| AgentEngineError::Failure(format!("failed to invoke agent runtime: {err}")))?;
-        if !status.success() {
-            return Err(AgentEngineError::Failure(format!(
-                "agent container for `{}` exited with status {status}",
-                self.reference
-            )));
+        let create_out = create_cmd
+            .output()
+            .context("failed to create agent container")?;
+        if !create_out.status.success() {
+            let stderr = String::from_utf8_lossy(&create_out.stderr);
+            bail!("agent container create failed: {}", stderr.trim());
         }
-        let report_path = out_dir.path().join("report.json");
-        let data = fs::read(&report_path).map_err(AgentEngineError::Io)?;
-        let report =
-            serde_json::from_slice(&data).map_err(AgentEngineError::Serialization)?;
+
+        let config = self.inspect_container_config(&container_name)?;
+        let spec = build_agent_trace_spec(entries, &config);
+        let spec_data =
+            serde_json::to_vec_pretty(&spec).context("failed to serialize agent trace spec")?;
+        fs::write(spec_dir.path().join("spec.json"), spec_data)
+            .context("failed to write agent trace spec")?;
+
+        debug!(
+            "spawning agent trace container `{}` via {:?}",
+            container_name, self.runtime_cmd
+        );
+        let mut start_cmd = self.base_command();
+        start_cmd.arg("start").arg("-a").arg(&container_name);
+        let start_status = start_cmd
+            .status()
+            .context("failed to start agent container")?;
+        if !start_status.success() {
+            let _ = self.base_command().arg("rm").arg(&container_name).status();
+            bail!("agent container `{container_name}` exited with status {start_status}");
+        }
+
+        let export_tar = export_dir.path().join("rootfs.tar");
+        let tar_file = File::create(&export_tar).context("failed to create agent export tar")?;
+        let mut export_cmd = self.base_command();
+        export_cmd
+            .arg("export")
+            .arg(&container_name)
+            .stdout(Stdio::from(tar_file));
+        let export_status = export_cmd
+            .status()
+            .context("failed to export agent container")?;
+        if !export_status.success() {
+            let _ = self.base_command().arg("rm").arg(&container_name).status();
+            bail!("agent container export failed for `{container_name}`");
+        }
+
+        let unpack_status = Command::new("tar")
+            .arg("-C")
+            .arg(export_dir.path())
+            .arg("-xf")
+            .arg(&export_tar)
+            .status()
+            .context("failed to unpack agent rootfs")?;
+        if !unpack_status.success() {
+            let _ = self.base_command().arg("rm").arg(&container_name).status();
+            bail!("failed to unpack exported rootfs");
+        }
+        let _ = fs::remove_file(&export_tar);
+        let _ = self.base_command().arg("rm").arg(&container_name).status();
+
+        let report_data =
+            fs::read(out_dir.path().join("report.json")).context("failed to read agent report")?;
+        let report: TraceSpecReport =
+            serde_json::from_slice(&report_data).context("failed to parse agent report")?;
         if self.keep_output {
             #[allow(deprecated)]
             let preserved = out_dir.into_path();
             info!(
                 "agent trace output for image `{}` preserved at {}",
-                self.reference,
+                reference,
                 preserved.display()
             );
         }
-        Ok(report)
+
+        Ok(AgentRunResult {
+            report,
+            rootfs: export_dir,
+            config,
+        })
+    }
+
+    fn inspect_container_config(&self, container: &str) -> Result<ImageConfig> {
+        let mut cmd = self.base_command();
+        cmd.arg("inspect")
+            .arg(container)
+            .arg("--format")
+            .arg("{{json .Config}}");
+        let output = cmd
+            .output()
+            .context("failed to inspect agent container config")?;
+        if !output.status.success() {
+            bail!(
+                "agent container inspect failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let cfg: DockerContainerConfig =
+            serde_json::from_slice(&output.stdout)
+                .context("failed to decode container config json")?;
+        Ok(cfg.into_image_config())
+    }
+
+    fn base_command(&self) -> Command {
+        let mut command = Command::new(&self.runtime_cmd[0]);
+        for arg in &self.runtime_cmd[1..] {
+            command.arg(arg);
+        }
+        command
+    }
+}
+
+#[derive(Deserialize)]
+struct DockerContainerConfig {
+    #[serde(rename = "Env")]
+    env: Option<Vec<String>>,
+    #[serde(rename = "WorkingDir")]
+    working_dir: Option<String>,
+    #[serde(rename = "Entrypoint")]
+    entrypoint: Option<Vec<String>>,
+    #[serde(rename = "Cmd")]
+    cmd: Option<Vec<String>>,
+}
+
+impl DockerContainerConfig {
+    fn into_image_config(self) -> ImageConfig {
+        ImageConfig {
+            workdir: self.working_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from),
+            entrypoint: self.entrypoint.unwrap_or_default(),
+            cmd: self.cmd.unwrap_or_default(),
+            env: self.env.unwrap_or_default(),
+        }
     }
 }
 
@@ -984,6 +1430,23 @@ fn bind_mount_arg(source: &Path, target: &str, mode: &str) -> OsString {
         value.push(mode);
     }
     value
+}
+
+fn sanitize_reference(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn current_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn log_closure_stats(label: &str, closure: &DependencyClosure) {

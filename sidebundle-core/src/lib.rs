@@ -213,6 +213,7 @@ pub struct DependencyClosure {
     pub files: Vec<ResolvedFile>,
     pub entry_plans: Vec<EntryBundlePlan>,
     pub traced_files: Vec<TracedFile>,
+    pub runtime_aliases: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl DependencyClosure {
@@ -283,6 +284,11 @@ impl DependencyClosure {
             }
         }
 
+        for (source, aliases) in other.runtime_aliases {
+            let entry = self.runtime_aliases.entry(source).or_default();
+            entry.extend(aliases);
+        }
+
         report
     }
 }
@@ -338,6 +344,7 @@ mod tests {
                 resolved: PathBuf::from("/etc/ssl/cert.pem"),
                 is_elf: false,
             }],
+            runtime_aliases: HashMap::new(),
         };
 
         let other = DependencyClosure {
@@ -358,6 +365,7 @@ mod tests {
                     is_elf: false,
                 },
             ],
+            runtime_aliases: HashMap::new(),
         };
 
         let report = base.merge(other);
@@ -379,6 +387,7 @@ mod tests {
             )],
             entry_plans: Vec::new(),
             traced_files: Vec::new(),
+            runtime_aliases: HashMap::new(),
         };
 
         let other = DependencyClosure {
@@ -389,6 +398,7 @@ mod tests {
             )],
             entry_plans: Vec::new(),
             traced_files: Vec::new(),
+            runtime_aliases: HashMap::new(),
         };
 
         let report = base.merge(other);

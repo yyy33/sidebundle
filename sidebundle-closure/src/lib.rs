@@ -5,6 +5,7 @@ pub mod validator;
 
 use crate::image::ImageRoot;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use log::warn;
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -151,6 +152,7 @@ impl ResolverSet {
     pub fn get(&self, origin: &Origin) -> Option<Arc<dyn PathResolver>> {
         self.resolvers.get(origin).cloned()
     }
+
 }
 
 impl Default for ResolverSet {
@@ -168,6 +170,7 @@ pub struct ClosureBuilder {
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
     resolvers: ResolverSet,
+    external_traces: HashMap<Origin, Vec<PathBuf>>,
 }
 
 impl ClosureBuilder {
@@ -184,6 +187,7 @@ impl ClosureBuilder {
             runner: LinkerRunner::new(),
             tracer: None,
             resolvers: ResolverSet::new(),
+            external_traces: HashMap::new(),
         }
     }
 
@@ -202,10 +206,24 @@ impl ClosureBuilder {
         self
     }
 
-    pub fn build(&self, spec: &BundleSpec) -> Result<DependencyClosure, ClosureError> {
+    pub fn with_external_trace_paths(
+        mut self,
+        origin: Origin,
+        paths: Vec<PathBuf>,
+    ) -> Self {
+        self.external_traces
+            .entry(origin)
+            .or_insert_with(Vec::new)
+            .extend(paths);
+        self
+    }
+
+    pub fn build(&mut self, spec: &BundleSpec) -> Result<DependencyClosure, ClosureError> {
         if spec.entries().is_empty() {
             return Ok(DependencyClosure::default());
         }
+
+        let mut runtime_aliases: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
 
         let mut file_map: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
         let mut entry_plans = Vec::new();
@@ -215,7 +233,13 @@ impl ClosureBuilder {
 
         for entry in spec.entries() {
             let resolver = self.resolver_for(entry.logical.origin())?;
-            let plan = self.build_entry(entry, resolver.as_ref(), &mut file_map, &mut elf_cache)?;
+            let plan = self.build_entry(
+                entry,
+                resolver.as_ref(),
+                &mut file_map,
+                &mut runtime_aliases,
+                &mut elf_cache,
+            )?;
             entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
                 let mut command = trace::TraceCommand::new(entry.logical.clone());
@@ -242,6 +266,38 @@ impl ClosureBuilder {
             }
         }
 
+        for (origin, runtime_paths) in &self.external_traces {
+            let resolver = self.resolver_for(origin)?;
+            let origin_map = traced_map.entry(origin.clone()).or_default();
+            for runtime_path in runtime_paths {
+                if let Some(host_path) = resolver.runtime_to_host(runtime_path) {
+                    let canonical_host = match canonicalize(&host_path, resolver.trace_root()) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            warn!(
+                                "skipping traced path {}: failed to canonicalize ({err})",
+                                runtime_path.display()
+                            );
+                            continue;
+                        }
+                    };
+                    let artifact = trace::TraceArtifact {
+                        runtime_path: runtime_path.clone(),
+                        host_path: Some(canonical_host.clone()),
+                        logical_path: Some(LogicalPath::new(
+                            origin.clone(),
+                            runtime_path.clone(),
+                        )),
+                    };
+                    if let Some(traced) = self.make_trace_artifact(&artifact) {
+                        origin_map
+                            .entry(traced.resolved.clone())
+                            .or_insert(traced);
+                    }
+                }
+            }
+        }
+
         for (origin, artifacts) in traced_map {
             let resolver = self.resolver_for(&origin)?;
             let traced_files: Vec<TracedFile> = artifacts.values().cloned().collect();
@@ -249,9 +305,16 @@ impl ClosureBuilder {
                 resolver.as_ref(),
                 &origin,
                 &mut file_map,
+                &mut runtime_aliases,
                 &mut elf_cache,
                 &traced_files,
             )?;
+            self.promote_traced_resources(
+                resolver.as_ref(),
+                &mut file_map,
+                &mut runtime_aliases,
+                &traced_files,
+            );
             traced_files_acc.extend(traced_files);
         }
 
@@ -265,10 +328,16 @@ impl ClosureBuilder {
             });
         }
 
+        let runtime_aliases = runtime_aliases
+            .iter()
+            .map(|(source, aliases)| (source.clone(), aliases.iter().cloned().collect()))
+            .collect();
+
         Ok(DependencyClosure {
             files,
             entry_plans,
             traced_files: traced_files_acc,
+            runtime_aliases,
         })
     }
 
@@ -307,6 +376,7 @@ impl ClosureBuilder {
         resolver: &dyn PathResolver,
         origin: &Origin,
         files: &mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
         traced: &[TracedFile],
     ) -> Result<(), ClosureError> {
@@ -323,10 +393,36 @@ impl ClosureBuilder {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("traced-entry");
-            let _ =
-                self.build_entry_plan(resolver, origin, &artifact.resolved, display, files, cache)?;
+            let _ = self.build_entry_plan(
+                resolver,
+                origin,
+                &artifact.resolved,
+                display,
+                files,
+                aliases,
+                cache,
+            )?;
         }
         Ok(())
+    }
+
+    fn promote_traced_resources(
+        &self,
+        resolver: &dyn PathResolver,
+        files: &mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+        traced: &[TracedFile],
+    ) {
+        for artifact in traced {
+            if artifact.is_elf {
+                continue;
+            }
+            let source = &artifact.resolved;
+            if !source.exists() {
+                continue;
+            }
+            let _ = ensure_file(resolver, files, aliases, source, Some(&artifact.original));
+        }
     }
 
     fn build_entry(
@@ -334,6 +430,7 @@ impl ClosureBuilder {
         entry: &BundleEntry,
         resolver: &dyn PathResolver,
         files: &mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         let entry_source = self.canonical_entry_path(resolver, &entry.logical)?;
@@ -343,6 +440,7 @@ impl ClosureBuilder {
             &entry_source,
             &entry.display_name,
             files,
+            aliases,
             cache,
         )
     }
@@ -354,16 +452,17 @@ impl ClosureBuilder {
         entry_source: &Path,
         display_name: &str,
         files: &mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         let entry_metadata = self.load_metadata(entry_source, cache)?;
-        let entry_dest = ensure_file(files, entry_source);
+        let entry_dest = ensure_file(resolver, files, aliases, entry_source, None);
 
         let (interpreter_source, interpreter_dest, is_static) =
             match entry_metadata.interpreter.clone() {
                 Some(path) => {
                     let canonical = canonicalize(&path, resolver.trace_root())?;
-                    let dest = ensure_file(files, &canonical);
+                    let dest = ensure_file(resolver, files, aliases, &canonical, Some(&path));
                     (Some(canonical), Some(dest), false)
                 }
                 None => (None, None, true),
@@ -397,7 +496,15 @@ impl ClosureBuilder {
                     continue;
                 }
                 let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
-                let dest = ensure_file(files, &canonical);
+                let alias_runtime = resolver.host_to_logical(&resolution.target)
+                    .map(|logical| logical.path().to_path_buf());
+                let dest = ensure_file(
+                    resolver,
+                    files,
+                    aliases,
+                    &canonical,
+                    alias_runtime.as_deref(),
+                );
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
                 }
@@ -561,12 +668,34 @@ fn canonicalize(path: &Path, root: Option<&Path>) -> Result<PathBuf, ClosureErro
     }
 }
 
-fn ensure_file(mapping: &mut BTreeMap<PathBuf, PathBuf>, source: &Path) -> PathBuf {
+fn ensure_file(
+    resolver: &dyn PathResolver,
+    mapping: &mut BTreeMap<PathBuf, PathBuf>,
+    aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    source: &Path,
+    runtime_alias: Option<&Path>,
+) -> PathBuf {
+    let canonical_logical = resolver
+        .host_to_logical(source)
+        .map(|logical| logical.path().to_path_buf());
     if let Some(dest) = mapping.get(source) {
+        if let Some(alias) = runtime_alias {
+            if should_record_alias(canonical_logical.as_deref(), alias) {
+                record_alias(aliases, source, alias);
+            }
+        }
         return dest.clone();
     }
     let mut dest = PathBuf::from("payload");
-    if source.is_absolute() {
+    if let Some(logical_path) = canonical_logical.as_deref() {
+        if logical_path.is_absolute() {
+            for component in logical_path.components().skip(1) {
+                dest.push(component.as_os_str());
+            }
+        } else {
+            dest.push(logical_path);
+        }
+    } else if source.is_absolute() {
         for component in source.components().skip(1) {
             dest.push(component.as_os_str());
         }
@@ -574,7 +703,28 @@ fn ensure_file(mapping: &mut BTreeMap<PathBuf, PathBuf>, source: &Path) -> PathB
         dest.push(source);
     }
     mapping.insert(source.to_path_buf(), dest.clone());
+    if let Some(alias) = runtime_alias {
+        if should_record_alias(canonical_logical.as_deref(), alias) {
+            record_alias(aliases, source, alias);
+        }
+    }
     dest
+}
+
+fn should_record_alias(canonical: Option<&Path>, alias: &Path) -> bool {
+    match canonical {
+        Some(path) => path != alias,
+        None => true,
+    }
+}
+
+fn record_alias(
+    aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    source: &Path,
+    runtime_path: &Path,
+) {
+    let entry = aliases.entry(source.to_path_buf()).or_default();
+    entry.insert(runtime_path.to_path_buf());
 }
 
 fn compute_digest(path: &Path) -> Result<String, ClosureError> {
@@ -654,7 +804,8 @@ mod tests {
         {
             let spec = BundleSpec::new("demo", TargetTriple::linux_x86_64())
                 .with_entry(BundleSpec::host_entry("/bin/ls", "ls"));
-            let closure = ClosureBuilder::new().build(&spec).unwrap();
+            let mut builder = ClosureBuilder::new();
+            let closure = builder.build(&spec).unwrap();
             assert!(
                 !closure.files.is_empty(),
                 "expected /bin/ls closure to contain files"
