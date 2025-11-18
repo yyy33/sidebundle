@@ -11,8 +11,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use env_logger::Env;
-use serde::Deserialize;
 use log::{debug, info, warn, LevelFilter};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shell_words;
 use sidebundle_closure::{
@@ -26,7 +26,7 @@ use sidebundle_closure::{
 };
 use sidebundle_core::{
     BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, ResolvedFile,
-    TargetTriple,
+    ResolvedSymlink, TargetTriple,
 };
 use sidebundle_packager::Packager;
 use tempfile::TempDir;
@@ -111,12 +111,8 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     let image_backend_choice = image_trace_backend.unwrap_or(trace_backend);
     let agent_launch = if matches!(image_backend_choice, TraceBackendArg::Agent) {
         Some(
-            AgentLaunchConfig::from_args(
-                image_agent_bin,
-                image_agent_cli,
-                image_agent_keep_output,
-            )
-            .context("failed to configure image agent settings")?,
+            AgentLaunchConfig::from_args(image_agent_bin, image_agent_cli, image_agent_keep_output)
+                .context("failed to configure image agent settings")?,
         )
     } else {
         None
@@ -565,8 +561,10 @@ fn ensure_system_assets(
     closure: &mut DependencyClosure,
     resolvers: &[(Origin, Arc<dyn PathResolver>)],
 ) -> Result<()> {
-    let mut existing: HashSet<PathBuf> =
-        closure.files.iter().map(|file| file.destination.clone()).collect();
+    let mut existing: HashSet<PathBuf> = HashSet::new();
+    for file in &closure.files {
+        mark_existing(&mut existing, &file.destination);
+    }
     for (origin, resolver) in resolvers {
         if !matches!(origin, Origin::Image(_)) {
             continue;
@@ -600,7 +598,7 @@ fn ensure_system_assets(
                 destination: destination.clone(),
                 digest,
             });
-            existing.insert(destination);
+            mark_existing(&mut existing, &destination);
         }
     }
     backfill_glibc_hwcaps(closure, resolvers, &mut existing)
@@ -642,7 +640,7 @@ fn backfill_glibc_hwcaps(
 ) -> Result<()> {
     for (origin, resolver) in resolvers {
         if let Origin::Image(_) = origin {
-            copy_lib64_aliases(origin.clone(), resolver.as_ref(), existing)?;
+            copy_lib64_aliases(closure, origin.clone(), resolver.as_ref(), existing)?;
             discover_hwcaps(closure, origin.clone(), resolver.as_ref(), existing)?;
         }
     }
@@ -650,6 +648,7 @@ fn backfill_glibc_hwcaps(
 }
 
 fn copy_lib64_aliases(
+    closure: &mut DependencyClosure,
     origin: Origin,
     resolver: &dyn PathResolver,
     existing: &mut HashSet<PathBuf>,
@@ -665,7 +664,13 @@ fn copy_lib64_aliases(
         if let Ok(meta) = fs::symlink_metadata(&host_link) {
             if meta.file_type().is_symlink() {
                 let destination = payload_path_for(logical_link.path());
-                copy_symlink(&host_link, &destination, existing)?;
+                copy_symlink(
+                    closure,
+                    logical_link.path(),
+                    &host_link,
+                    &destination,
+                    existing,
+                )?;
                 continue;
             }
             if meta.is_dir() {
@@ -678,22 +683,13 @@ fn copy_lib64_aliases(
         let host_target = resolver.to_host(&logical_target);
         if fs::metadata(&host_target).is_ok() {
             let destination = payload_path_for(logical_link.path());
-            if destination.exists() {
-                continue;
-            }
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create parent for {}", destination.display())
-                })?;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::symlink;
-                symlink(Path::new(target), &destination).with_context(|| {
-                    format!("failed to create lib64 symlink {}", destination.display())
-                })?;
-            }
-            existing.insert(destination);
+            record_symlink_target(
+                closure,
+                logical_link.path(),
+                &destination,
+                Path::new(target),
+                existing,
+            )?;
         }
     }
     Ok(())
@@ -715,7 +711,7 @@ fn discover_hwcaps(
             } else if meta.file_type().is_symlink() {
                 if let Ok(target) = fs::read_link(&host) {
                     let dest = payload_path_for(logical.path());
-                    copy_symlink(&host, &dest, existing)?;
+                    record_symlink_target(closure, logical.path(), &dest, &target, existing)?;
                     let resolved = resolver.to_host(&LogicalPath::new(origin.clone(), target));
                     stack.push((resolved, logical.path().to_path_buf()));
                 }
@@ -758,10 +754,7 @@ fn discover_hwcaps(
                         continue;
                     }
                     let digest = compute_digest(&host_entry).with_context(|| {
-                        format!(
-                            "failed to hash glibc-hwcaps file {}",
-                            host_entry.display()
-                        )
+                        format!("failed to hash glibc-hwcaps file {}", host_entry.display())
                     })?;
                     debug!(
                         "adding glibc-hwcaps {} -> {}",
@@ -773,7 +766,7 @@ fn discover_hwcaps(
                         destination: destination.clone(),
                         digest,
                     });
-                    existing.insert(destination);
+                    mark_existing(existing, &destination);
                 }
                 _ => {}
             }
@@ -782,30 +775,107 @@ fn discover_hwcaps(
     Ok(())
 }
 
-fn copy_symlink(source: &Path, destination: &Path, existing: &mut HashSet<PathBuf>) -> Result<()> {
+fn copy_symlink(
+    closure: &mut DependencyClosure,
+    logical_path: &Path,
+    source: &Path,
+    destination: &Path,
+    existing: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let target = fs::read_link(source)
+        .with_context(|| format!("failed to read hwcaps symlink {}", source.display()))?;
+    record_symlink_target(closure, logical_path, destination, &target, existing)
+}
+
+fn record_symlink_target(
+    closure: &mut DependencyClosure,
+    logical_path: &Path,
+    destination: &Path,
+    target: &Path,
+    existing: &mut HashSet<PathBuf>,
+) -> Result<()> {
     if existing.contains(destination) {
         return Ok(());
     }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create glibc-hwcaps parent {}", parent.display())
-        })?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        if destination.exists() {
-            fs::remove_file(destination).ok();
-        }
-        let target = fs::read_link(source).with_context(|| {
-            format!("failed to read hwcaps symlink {}", source.display())
-        })?;
-        symlink(&target, destination).with_context(|| {
-            format!("failed to write hwcaps symlink {}", destination.display())
-        })?;
-    }
-    existing.insert(destination.to_path_buf());
+    let runtime_target = normalize_symlink_runtime_target(logical_path, target);
+    let bundle_target = payload_path_for(&runtime_target);
+    closure.symlinks.push(ResolvedSymlink::new(
+        destination.to_path_buf(),
+        bundle_target,
+    ));
+    mark_existing(existing, destination);
     Ok(())
+}
+
+fn normalize_symlink_runtime_target(logical_path: &Path, target: &Path) -> PathBuf {
+    let absolute = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        let parent = logical_path.parent().unwrap_or_else(|| Path::new("/"));
+        let mut base = if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            let mut rooted = PathBuf::from("/");
+            rooted.push(parent);
+            rooted
+        };
+        base.push(target);
+        base
+    };
+    clean_absolute_path(absolute)
+}
+
+fn clean_absolute_path(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+    let mut absolute = false;
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                absolute = true;
+                parts.clear();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
+            }
+            Component::Normal(segment) => parts.push(segment.to_os_string()),
+            _ => {}
+        }
+    }
+    let mut result = if absolute {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    };
+    for part in parts {
+        result.push(part);
+    }
+    if result.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else if result.is_absolute() {
+        result
+    } else {
+        let mut abs = PathBuf::from("/");
+        abs.push(result);
+        abs
+    }
+}
+
+fn mark_existing(existing: &mut HashSet<PathBuf>, path: &Path) {
+    let mut current = path.to_path_buf();
+    loop {
+        if existing.contains(&current) {
+            // still walk up to avoid missing parents
+        } else {
+            existing.insert(current.clone());
+        }
+        if !current.pop() {
+            break;
+        }
+    }
 }
 
 struct ImageClosureResult {
@@ -1043,12 +1113,9 @@ fn build_closure_from_root(
     if let Some(paths) = external_traces {
         builder = builder.with_external_trace_paths(origin.clone(), paths);
     }
-    if let Some(backend) = configure_image_trace_backend(
-        trace_backend,
-        backend,
-        reference,
-        agent_launch,
-    )? {
+    if let Some(backend) =
+        configure_image_trace_backend(trace_backend, backend, reference, agent_launch)?
+    {
         let mut tracer = TraceCollector::new().with_backend(backend);
         if !image_env.is_empty() {
             tracer = tracer.with_env(image_env.clone());
@@ -1382,9 +1449,8 @@ impl AgentTraceRunner {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let cfg: DockerContainerConfig =
-            serde_json::from_slice(&output.stdout)
-                .context("failed to decode container config json")?;
+        let cfg: DockerContainerConfig = serde_json::from_slice(&output.stdout)
+            .context("failed to decode container config json")?;
         Ok(cfg.into_image_config())
     }
 
@@ -1412,7 +1478,10 @@ struct DockerContainerConfig {
 impl DockerContainerConfig {
     fn into_image_config(self) -> ImageConfig {
         ImageConfig {
-            workdir: self.working_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from),
+            workdir: self
+                .working_dir
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
             entrypoint: self.entrypoint.unwrap_or_default(),
             cmd: self.cmd.unwrap_or_default(),
             env: self.env.unwrap_or_default(),

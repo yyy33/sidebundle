@@ -4,8 +4,8 @@ pub mod trace;
 pub mod validator;
 
 use crate::image::ImageRoot;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use log::warn;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -152,7 +152,6 @@ impl ResolverSet {
     pub fn get(&self, origin: &Origin) -> Option<Arc<dyn PathResolver>> {
         self.resolvers.get(origin).cloned()
     }
-
 }
 
 impl Default for ResolverSet {
@@ -206,11 +205,7 @@ impl ClosureBuilder {
         self
     }
 
-    pub fn with_external_trace_paths(
-        mut self,
-        origin: Origin,
-        paths: Vec<PathBuf>,
-    ) -> Self {
+    pub fn with_external_trace_paths(mut self, origin: Origin, paths: Vec<PathBuf>) -> Self {
         self.external_traces
             .entry(origin)
             .or_insert_with(Vec::new)
@@ -284,15 +279,10 @@ impl ClosureBuilder {
                     let artifact = trace::TraceArtifact {
                         runtime_path: runtime_path.clone(),
                         host_path: Some(canonical_host.clone()),
-                        logical_path: Some(LogicalPath::new(
-                            origin.clone(),
-                            runtime_path.clone(),
-                        )),
+                        logical_path: Some(LogicalPath::new(origin.clone(), runtime_path.clone())),
                     };
                     if let Some(traced) = self.make_trace_artifact(&artifact) {
-                        origin_map
-                            .entry(traced.resolved.clone())
-                            .or_insert(traced);
+                        origin_map.entry(traced.resolved.clone()).or_insert(traced);
                     }
                 }
             }
@@ -338,6 +328,7 @@ impl ClosureBuilder {
             entry_plans,
             traced_files: traced_files_acc,
             runtime_aliases,
+            symlinks: Vec::new(),
         })
     }
 
@@ -496,7 +487,8 @@ impl ClosureBuilder {
                     continue;
                 }
                 let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
-                let alias_runtime = resolver.host_to_logical(&resolution.target)
+                let alias_runtime = resolver
+                    .host_to_logical(&resolution.target)
                     .map(|logical| logical.path().to_path_buf());
                 let dest = ensure_file(
                     resolver,

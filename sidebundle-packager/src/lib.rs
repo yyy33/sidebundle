@@ -8,11 +8,14 @@ use log::{debug, info, warn};
 use pathdiff::diff_paths;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sidebundle_core::{BundleSpec, DependencyClosure, TracedFile};
+use sidebundle_core::{BundleSpec, DependencyClosure, ResolvedSymlink, TracedFile};
 use thiserror::Error;
 
 mod launcher;
 use launcher::write_launchers;
+
+const NOVDSO_REL_PATH: &str = "payload/lib/.sidebundle-novdso.so";
+const NOVDSO_BYTES: &[u8] = include_bytes!(env!("SIDEBUNDLE_NOVDSO_LIB"));
 
 /// Writes the dependency closure to disk and generates launchers.
 #[derive(Debug, Clone)]
@@ -168,7 +171,12 @@ impl Packager {
             );
         }
 
+        for link in &closure.symlinks {
+            write_bundle_symlink(&bundle_root, link)?;
+        }
+
         write_launchers(&bundle_root, &closure.entry_plans)?;
+        write_support_artifacts(&bundle_root)?;
 
         let mut traced_manifest = Vec::new();
         for traced in &traced_queue {
@@ -328,6 +336,100 @@ fn link_or_copy(stored: &Path, dest: &Path) -> Result<(), PackagerError> {
         source,
     })?;
     copy_permissions(stored, dest).ok();
+    Ok(())
+}
+
+fn write_bundle_symlink(bundle_root: &Path, link: &ResolvedSymlink) -> Result<(), PackagerError> {
+    let dest_path = bundle_root.join(&link.destination);
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    if dest_path.exists() {
+        let meta = fs::symlink_metadata(&dest_path).map_err(|source| PackagerError::Io {
+            path: dest_path.clone(),
+            source,
+        })?;
+        if meta.is_dir() {
+            debug!(
+                "packager: skipping symlink {} because directory already exists",
+                dest_path.display()
+            );
+            return Ok(());
+        }
+        fs::remove_file(&dest_path).map_err(|source| PackagerError::Io {
+            path: dest_path.clone(),
+            source,
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let relative_target = relative_symlink_target(bundle_root, &dest_path, &link.bundle_target);
+        symlink(&relative_target, &dest_path).map_err(|source| PackagerError::Io {
+            path: dest_path.clone(),
+            source,
+        })?;
+        debug!(
+            "packager: symlink {} -> {}",
+            dest_path.display(),
+            relative_target.display()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let source_abs = bundle_root.join(&link.bundle_target);
+        fs::copy(&source_abs, &dest_path).map_err(|source| PackagerError::Io {
+            path: dest_path.clone(),
+            source,
+        })?;
+        copy_permissions(&source_abs, &dest_path).ok();
+    }
+    Ok(())
+}
+
+fn relative_symlink_target(bundle_root: &Path, dest: &Path, bundle_target: &Path) -> PathBuf {
+    let target_abs = bundle_root.join(bundle_target);
+    if let Some(parent) = dest.parent() {
+        if let Some(relative) = diff_paths(&target_abs, parent) {
+            if relative.as_os_str().is_empty() {
+                return PathBuf::from(".");
+            }
+            return relative;
+        }
+    }
+    bundle_target.to_path_buf()
+}
+
+fn write_support_artifacts(bundle_root: &Path) -> Result<(), PackagerError> {
+    let novdso_path = bundle_root.join(NOVDSO_REL_PATH);
+    if let Some(parent) = novdso_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(&novdso_path, NOVDSO_BYTES).map_err(|source| PackagerError::Io {
+        path: novdso_path.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&novdso_path)
+            .map_err(|source| PackagerError::Io {
+                path: novdso_path.clone(),
+                source,
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&novdso_path, perms).map_err(|source| PackagerError::Io {
+            path: novdso_path.clone(),
+            source,
+        })?;
+    }
     Ok(())
 }
 
@@ -516,5 +618,4 @@ mod tests {
         let packager = Packager::new();
         assert!(packager.emit(&spec, &closure).is_err());
     }
-
 }

@@ -43,7 +43,10 @@ fn write_config(dir: &Path, plan: &EntryBundlePlan) -> Result<(), PackagerError>
         source,
     })?;
     let mut content = String::new();
-    content.push_str(&format!("dynamic={}\n", if plan.requires_linker { 1 } else { 0 }));
+    content.push_str(&format!(
+        "dynamic={}\n",
+        if plan.requires_linker { 1 } else { 0 }
+    ));
     content.push_str(&format!("binary={}\n", plan.binary_destination.display()));
     if plan.requires_linker {
         content.push_str(&format!("linker={}\n", plan.linker_destination.display()));
@@ -55,10 +58,11 @@ fn write_config(dir: &Path, plan: &EntryBundlePlan) -> Result<(), PackagerError>
             .join(":");
         content.push_str(&format!("library_paths={}\n", joined));
     }
-    file.write_all(content.as_bytes()).map_err(|source| PackagerError::Io {
-        path: config_path.clone(),
-        source,
-    })?;
+    file.write_all(content.as_bytes())
+        .map_err(|source| PackagerError::Io {
+            path: config_path.clone(),
+            source,
+        })?;
     Ok(())
 }
 
@@ -95,11 +99,12 @@ fn set_exec_permissions(path: &Path) -> Result<(), PackagerError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path).map_err(|source| PackagerError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .permissions();
+        let mut perms = fs::metadata(path)
+            .map_err(|source| PackagerError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).map_err(|source| PackagerError::Io {
             path: path.to_path_buf(),

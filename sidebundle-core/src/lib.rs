@@ -207,6 +207,21 @@ pub struct EntryBundlePlan {
     pub requires_linker: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedSymlink {
+    pub destination: PathBuf,
+    pub bundle_target: PathBuf,
+}
+
+impl ResolvedSymlink {
+    pub fn new(destination: impl Into<PathBuf>, bundle_target: impl Into<PathBuf>) -> Self {
+        Self {
+            destination: destination.into(),
+            bundle_target: bundle_target.into(),
+        }
+    }
+}
+
 /// 依赖闭包汇总结果，供装配/打包复用。
 #[derive(Debug, Default, Clone)]
 pub struct DependencyClosure {
@@ -214,6 +229,7 @@ pub struct DependencyClosure {
     pub entry_plans: Vec<EntryBundlePlan>,
     pub traced_files: Vec<TracedFile>,
     pub runtime_aliases: HashMap<PathBuf, Vec<PathBuf>>,
+    pub symlinks: Vec<ResolvedSymlink>,
 }
 
 impl DependencyClosure {
@@ -242,6 +258,11 @@ impl DependencyClosure {
             .traced_files
             .iter()
             .map(|file| file.resolved.clone())
+            .collect();
+        let mut symlink_map: HashMap<PathBuf, PathBuf> = self
+            .symlinks
+            .iter()
+            .map(|link| (link.destination.clone(), link.bundle_target.clone()))
             .collect();
 
         let mut report = MergeReport::default();
@@ -281,6 +302,17 @@ impl DependencyClosure {
             if traced_set.insert(traced.resolved.clone()) {
                 report.traced_added += 1;
                 self.traced_files.push(traced);
+            }
+        }
+
+        for link in other.symlinks {
+            match symlink_map.get(&link.destination) {
+                Some(existing_target) if existing_target == &link.bundle_target => {}
+                Some(_) => continue,
+                None => {
+                    symlink_map.insert(link.destination.clone(), link.bundle_target.clone());
+                    self.symlinks.push(link);
+                }
             }
         }
 
@@ -345,6 +377,7 @@ mod tests {
                 is_elf: false,
             }],
             runtime_aliases: HashMap::new(),
+            symlinks: Vec::new(),
         };
 
         let other = DependencyClosure {
@@ -366,6 +399,7 @@ mod tests {
                 },
             ],
             runtime_aliases: HashMap::new(),
+            symlinks: Vec::new(),
         };
 
         let report = base.merge(other);
@@ -388,6 +422,7 @@ mod tests {
             entry_plans: Vec::new(),
             traced_files: Vec::new(),
             runtime_aliases: HashMap::new(),
+            symlinks: Vec::new(),
         };
 
         let other = DependencyClosure {
@@ -399,6 +434,7 @@ mod tests {
             entry_plans: Vec::new(),
             traced_files: Vec::new(),
             runtime_aliases: HashMap::new(),
+            symlinks: Vec::new(),
         };
 
         let report = base.merge(other);
