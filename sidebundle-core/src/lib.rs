@@ -2,7 +2,8 @@ mod elf;
 
 pub use elf::{parse_elf_metadata, ElfMetadata, ElfParseError};
 
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
@@ -106,6 +107,40 @@ impl LogicalPath {
 pub enum Origin {
     Host,
     Image(String),
+}
+
+/// 单条 AUXV 数据（键值对）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuxvEntry {
+    pub key: u64,
+    pub value: u64,
+}
+
+/// uname 快照，描述目标期望的内核/机器信息。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SystemInfo {
+    pub sysname: String,
+    pub nodename: String,
+    pub release: String,
+    pub version: String,
+    pub machine: String,
+}
+
+/// 入口所需的运行期元数据（AUXV、环境变量等）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RuntimeMetadata {
+    #[serde(default)]
+    pub auxv: Vec<AuxvEntry>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uname: Option<SystemInfo>,
+}
+
+impl RuntimeMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.auxv.is_empty() && self.env.is_empty() && self.uname.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +265,7 @@ pub struct DependencyClosure {
     pub traced_files: Vec<TracedFile>,
     pub runtime_aliases: HashMap<PathBuf, Vec<PathBuf>>,
     pub symlinks: Vec<ResolvedSymlink>,
+    pub metadata: HashMap<Origin, RuntimeMetadata>,
 }
 
 impl DependencyClosure {
@@ -320,6 +356,9 @@ impl DependencyClosure {
             let entry = self.runtime_aliases.entry(source).or_default();
             entry.extend(aliases);
         }
+        for (origin, snapshot) in other.metadata {
+            self.metadata.entry(origin).or_insert(snapshot);
+        }
 
         report
     }
@@ -378,6 +417,7 @@ mod tests {
             }],
             runtime_aliases: HashMap::new(),
             symlinks: Vec::new(),
+            metadata: HashMap::new(),
         };
 
         let other = DependencyClosure {
@@ -400,6 +440,7 @@ mod tests {
             ],
             runtime_aliases: HashMap::new(),
             symlinks: Vec::new(),
+            metadata: HashMap::new(),
         };
 
         let report = base.merge(other);
@@ -423,6 +464,7 @@ mod tests {
             traced_files: Vec::new(),
             runtime_aliases: HashMap::new(),
             symlinks: Vec::new(),
+            metadata: HashMap::new(),
         };
 
         let other = DependencyClosure {
@@ -435,6 +477,7 @@ mod tests {
             traced_files: Vec::new(),
             runtime_aliases: HashMap::new(),
             symlinks: Vec::new(),
+            metadata: HashMap::new(),
         };
 
         let report = base.merge(other);

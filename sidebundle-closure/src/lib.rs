@@ -352,6 +352,7 @@ impl ClosureBuilder {
             traced_files: traced_files_acc,
             runtime_aliases,
             symlinks: Vec::new(),
+            metadata: HashMap::new(),
         })
     }
 

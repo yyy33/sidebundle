@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{CStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{ErrorKind, Read};
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -25,8 +26,8 @@ use sidebundle_closure::{
     ChrootPathResolver, ClosureBuilder, PathResolver, ResolverSet,
 };
 use sidebundle_core::{
-    BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, ResolvedFile,
-    TargetTriple,
+    AuxvEntry, BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin,
+    ResolvedFile, RuntimeMetadata, SystemInfo, TargetTriple,
 };
 use sidebundle_packager::Packager;
 use tempfile::TempDir;
@@ -224,6 +225,8 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
     if trace_spec.commands.is_empty() {
         bail!("agent: trace spec did not contain any commands");
     }
+    let runtime_metadata =
+        capture_runtime_metadata().context("agent: failed to capture runtime metadata")?;
 
     let backend =
         resolve_trace_backend(args.trace_backend).context("failed to configure trace backend")?;
@@ -266,6 +269,7 @@ fn execute_agent_trace(args: AgentTraceArgs) -> Result<()> {
     let report = TraceSpecReport {
         schema_version: TRACE_REPORT_VERSION,
         files: files.into_iter().collect(),
+        metadata: Some(runtime_metadata),
     };
     let report_path = args.output.join("report.json");
     let tmp_path = report_path.with_extension("tmp");
@@ -740,6 +744,7 @@ fn build_with_backend(
                 trace_backend,
                 agent_launch,
                 None,
+                None,
             )
         }
         BackendPreference::Podman | BackendPreference::Auto => {
@@ -756,6 +761,7 @@ fn build_with_backend(
                 entries,
                 trace_backend,
                 agent_launch,
+                None,
                 None,
             )
         }
@@ -784,14 +790,24 @@ fn build_agent_image_closure(
         backend, reference
     );
     let run_result = runner.run(reference, entries)?;
+    let AgentRunResult {
+        report,
+        rootfs,
+        config,
+    } = run_result;
+    let TraceSpecReport {
+        schema_version: _,
+        files: trace_files,
+        metadata,
+    } = report;
     debug!(
         "agent: trace for `{}` captured {} file(s); exported rootfs at {}",
         reference,
-        run_result.report.files.len(),
-        run_result.rootfs.path().display()
+        trace_files.len(),
+        rootfs.path().display()
     );
     for entry in entries {
-        let host_path = physical_image_path(run_result.rootfs.path(), &entry.path);
+        let host_path = physical_image_path(rootfs.path(), &entry.path);
         if let Err(err) = std::fs::metadata(&host_path) {
             warn!(
                 "agent: entry {} missing from exported rootfs at {} ({err})",
@@ -806,9 +822,9 @@ fn build_agent_image_closure(
             );
         }
     }
-    let export_guard = run_result.rootfs;
+    let export_guard = rootfs;
     let export_path = export_guard.path().to_path_buf();
-    let config = run_result.config.clone();
+    let config = config;
     let mut image_root = ImageRoot::new(reference, export_path, config);
     image_root = image_root.with_cleanup(move || drop(export_guard));
     build_closure_from_root(
@@ -820,7 +836,8 @@ fn build_agent_image_closure(
         entries,
         TraceBackendArg::Off,
         None,
-        Some(run_result.report.files),
+        Some(trace_files),
+        metadata,
     )
 }
 
@@ -834,6 +851,7 @@ fn build_closure_from_root(
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
     external_traces: Option<Vec<PathBuf>>,
+    metadata: Option<RuntimeMetadata>,
 ) -> Result<ImageClosureResult> {
     let rootfs = root.rootfs().to_path_buf();
     let image_env = parse_image_env(&root.config().env);
@@ -880,9 +898,14 @@ fn build_closure_from_root(
         builder = builder.with_tracer(tracer);
     }
 
-    let closure = builder
+    let mut closure = builder
         .build(&spec)
         .with_context(|| format!("failed to build closure inside image `{reference}`"))?;
+    if let Some(snapshot) = metadata {
+        if !snapshot.is_empty() {
+            closure.metadata.insert(origin.clone(), snapshot);
+        }
+    }
     Ok(ImageClosureResult {
         closure,
         resolver_entries: vec![(origin, chroot_resolver)],
@@ -1350,6 +1373,76 @@ fn log_validation_report(report: &ValidationReport) {
             }
         }
     }
+}
+
+fn capture_runtime_metadata() -> Result<RuntimeMetadata> {
+    let auxv = read_auxv_entries().context("failed to read /proc/self/auxv")?;
+    let mut env_map = BTreeMap::new();
+    for (key, value) in env::vars() {
+        env_map.insert(key, value);
+    }
+    let uname = match capture_uname() {
+        Ok(info) => Some(info),
+        Err(err) => {
+            debug!("agent: failed to capture uname snapshot: {err}");
+            None
+        }
+    };
+    Ok(RuntimeMetadata {
+        auxv,
+        env: env_map,
+        uname,
+    })
+}
+
+fn read_auxv_entries() -> Result<Vec<AuxvEntry>> {
+    let mut file = File::open("/proc/self/auxv")
+        .with_context(|| "failed to open /proc/self/auxv for metadata capture")?;
+    let mut entries = Vec::new();
+    let mut buf = [0u8; 16];
+    loop {
+        match file.read_exact(&mut buf) {
+            Ok(()) => {
+                let mut tag_bytes = [0u8; 8];
+                tag_bytes.copy_from_slice(&buf[..8]);
+                let tag = u64::from_ne_bytes(tag_bytes);
+                let mut value_bytes = [0u8; 8];
+                value_bytes.copy_from_slice(&buf[8..]);
+                let value = u64::from_ne_bytes(value_bytes);
+                if tag == 0 {
+                    break;
+                }
+                entries.push(AuxvEntry { key: tag, value });
+            }
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| "failed to read /proc/self/auxv while capturing metadata")
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn capture_uname() -> Result<SystemInfo> {
+    let mut uts = MaybeUninit::<libc::utsname>::zeroed();
+    let rc = unsafe { libc::uname(uts.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("uname call failed while capturing metadata");
+    }
+    let uts = unsafe { uts.assume_init() };
+    Ok(SystemInfo {
+        sysname: uts_field_to_string(&uts.sysname),
+        nodename: uts_field_to_string(&uts.nodename),
+        release: uts_field_to_string(&uts.release),
+        version: uts_field_to_string(&uts.version),
+        machine: uts_field_to_string(&uts.machine),
+    })
+}
+
+fn uts_field_to_string(buf: &[libc::c_char]) -> String {
+    unsafe { CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned() }
 }
 
 fn describe_status(status: &EntryValidationStatus) -> String {

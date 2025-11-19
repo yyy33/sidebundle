@@ -1,5 +1,6 @@
 use crate::trace::{TraceBackend, TraceError, TraceInvocation, TraceReport};
 use serde::{Deserialize, Serialize};
+use sidebundle_core::RuntimeMetadata;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -61,6 +62,8 @@ pub struct TraceSpecReport {
     pub schema_version: u32,
     #[serde(default)]
     pub files: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<RuntimeMetadata>,
 }
 
 impl TraceSpecReport {

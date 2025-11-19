@@ -8,3 +8,4 @@ authors.workspace = true
 [dependencies]
 goblin = "0.10.3"
 sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
