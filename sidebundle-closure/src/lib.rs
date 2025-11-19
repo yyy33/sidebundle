@@ -32,6 +32,22 @@ const DEFAULT_LIBRARY_DIRS: &[&str] = &[
 
 const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run"];
 const TRACE_SKIP_FILENAMES: &[&str] = &["locale-archive"];
+const GLIBC_HWCAPS_SEGMENT: &str = "glibc-hwcaps";
+const GPU_LIB_PREFIXES: &[&str] = &[
+    "libgl",
+    "libgldispatch",
+    "libglx",
+    "libegl",
+    "libgles",
+    "libopencl",
+    "libvulkan",
+    "libcuda",
+    "libnvidia",
+    "libdrm",
+    "libnvoptix",
+    "libopenvr",
+    "libxnvctrl",
+];
 
 pub trait PathResolver: Send + Sync {
     fn trace_root(&self) -> Option<&Path>;
@@ -310,6 +326,13 @@ impl ClosureBuilder {
 
         let mut files = Vec::new();
         for (source, destination) in file_map.into_iter() {
+            if let Some(reason) = classify_high_risk_asset(&source) {
+                debug!(
+                    "omitting {} from closure (filtered: {reason})",
+                    source.display()
+                );
+                continue;
+            }
             let digest = compute_digest(&source)?;
             files.push(ResolvedFile {
                 source,
@@ -351,6 +374,13 @@ impl ClosureBuilder {
     fn make_trace_artifact(&self, original: &trace::TraceArtifact) -> Option<TracedFile> {
         let resolved = original.host_path.as_ref()?;
         if !trace_path_allowed(resolved) {
+            return None;
+        }
+        if let Some(reason) = classify_high_risk_asset(resolved) {
+            debug!(
+                "skipping traced artifact {} (filtered: {reason})",
+                resolved.display()
+            );
             return None;
         }
         let host_path = resolved.clone();
@@ -410,6 +440,10 @@ impl ClosureBuilder {
             }
             let source = &artifact.resolved;
             if !source.exists() {
+                continue;
+            }
+            if let Some(reason) = classify_high_risk_asset(source) {
+                debug!("skipping traced resource {} ({reason})", source.display());
                 continue;
             }
             let _ = ensure_file(resolver, files, aliases, source, Some(&artifact.original));
@@ -487,6 +521,14 @@ impl ClosureBuilder {
                     continue;
                 }
                 let canonical = canonicalize(&resolution.target, resolver.trace_root())?;
+                if let Some(reason) = classify_high_risk_asset(&canonical) {
+                    debug!(
+                        "skipping dependency {} for {} ({reason})",
+                        canonical.display(),
+                        current.display()
+                    );
+                    continue;
+                }
                 let alias_runtime = resolver
                     .host_to_logical(&resolution.target)
                     .map(|logical| logical.path().to_path_buf());
@@ -765,6 +807,25 @@ fn trace_path_allowed(path: &Path) -> bool {
     }
 }
 
+fn classify_high_risk_asset(path: &Path) -> Option<&'static str> {
+    for component in path.components() {
+        if let Some(name) = component.as_os_str().to_str() {
+            if name.eq_ignore_ascii_case(GLIBC_HWCAPS_SEGMENT) {
+                return Some("glibc-hwcaps");
+            }
+        }
+    }
+    if let Some(file) = path.file_name().and_then(|n| n.to_str()) {
+        let lower = file.to_ascii_lowercase();
+        for prefix in GPU_LIB_PREFIXES {
+            if lower.starts_with(prefix) {
+                return Some("gpu-driver");
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Error)]
 pub enum ClosureError {
     #[error("failed to read {path}: {source}")]
@@ -829,5 +890,25 @@ mod tests {
     fn trace_filter_keeps_regular_file() {
         let path = env::current_dir().unwrap().join("Cargo.toml");
         assert!(trace_path_allowed(&path));
+    }
+
+    #[test]
+    fn classify_blocks_glibc_hwcaps() {
+        let path = Path::new("/usr/lib/glibc-hwcaps/x86-64-v2/libc.so.6");
+        assert_eq!(
+            classify_high_risk_asset(path),
+            Some("glibc-hwcaps"),
+            "expected glibc-hwcaps path to be filtered"
+        );
+    }
+
+    #[test]
+    fn classify_blocks_gpu_drivers() {
+        let path = Path::new("/usr/lib/x86_64-linux-gnu/libcuda.so.1");
+        assert_eq!(
+            classify_high_risk_asset(path),
+            Some("gpu-driver"),
+            "expected libcuda to be filtered"
+        );
     }
 }

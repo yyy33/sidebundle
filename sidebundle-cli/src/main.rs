@@ -26,7 +26,7 @@ use sidebundle_closure::{
 };
 use sidebundle_core::{
     BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin, ResolvedFile,
-    ResolvedSymlink, TargetTriple,
+    TargetTriple,
 };
 use sidebundle_packager::Packager;
 use tempfile::TempDir;
@@ -601,7 +601,7 @@ fn ensure_system_assets(
             mark_existing(&mut existing, &destination);
         }
     }
-    backfill_glibc_hwcaps(closure, resolvers, &mut existing)
+    Ok(())
 }
 
 fn payload_path_for(path: &Path) -> PathBuf {
@@ -633,237 +633,6 @@ fn compute_digest(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn backfill_glibc_hwcaps(
-    closure: &mut DependencyClosure,
-    resolvers: &[(Origin, Arc<dyn PathResolver>)],
-    existing: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    for (origin, resolver) in resolvers {
-        if let Origin::Image(_) = origin {
-            copy_lib64_aliases(closure, origin.clone(), resolver.as_ref(), existing)?;
-            discover_hwcaps(closure, origin.clone(), resolver.as_ref(), existing)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_lib64_aliases(
-    closure: &mut DependencyClosure,
-    origin: Origin,
-    resolver: &dyn PathResolver,
-    existing: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    const ALIASES: &[(&str, &str)] = &[
-        ("/lib64", "/lib"),
-        ("/usr/lib64", "/usr/lib"),
-        ("/lib64", "/usr/lib"),
-    ];
-    for (link, target) in ALIASES {
-        let logical_link = LogicalPath::new(origin.clone(), PathBuf::from(link));
-        let host_link = resolver.to_host(&logical_link);
-        if let Ok(meta) = fs::symlink_metadata(&host_link) {
-            if meta.file_type().is_symlink() {
-                let destination = payload_path_for(logical_link.path());
-                copy_symlink(
-                    closure,
-                    logical_link.path(),
-                    &host_link,
-                    &destination,
-                    existing,
-                )?;
-                continue;
-            }
-            if meta.is_dir() {
-                continue;
-            }
-        } else {
-            continue;
-        }
-        let logical_target = LogicalPath::new(origin.clone(), PathBuf::from(target));
-        let host_target = resolver.to_host(&logical_target);
-        if fs::metadata(&host_target).is_ok() {
-            let destination = payload_path_for(logical_link.path());
-            record_symlink_target(
-                closure,
-                logical_link.path(),
-                &destination,
-                Path::new(target),
-                existing,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn discover_hwcaps(
-    closure: &mut DependencyClosure,
-    origin: Origin,
-    resolver: &dyn PathResolver,
-    existing: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    let mut stack = Vec::new();
-    for dir in GLIBC_HWCAPS_DIRS {
-        let logical = LogicalPath::new(origin.clone(), PathBuf::from(dir));
-        let host = resolver.to_host(&logical);
-        if let Ok(meta) = fs::symlink_metadata(&host) {
-            if meta.is_dir() {
-                stack.push((host, logical.path().to_path_buf()));
-            } else if meta.file_type().is_symlink() {
-                if let Ok(target) = fs::read_link(&host) {
-                    let dest = payload_path_for(logical.path());
-                    record_symlink_target(closure, logical.path(), &dest, &target, existing)?;
-                    let resolved = resolver.to_host(&LogicalPath::new(origin.clone(), target));
-                    stack.push((resolved, logical.path().to_path_buf()));
-                }
-                continue;
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        }
-    }
-    while let Some((host_path, logical_path)) = stack.pop() {
-        let entries = match fs::read_dir(&host_path) {
-            Ok(entries) => entries,
-            Err(err) => {
-                warn!(
-                    "failed to read glibc-hwcaps dir {}: {err}",
-                    host_path.display()
-                );
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    warn!("failed to enumerate dir: {err}");
-                    continue;
-                }
-            };
-            let host_entry = entry.path();
-            let logical_entry = logical_path.join(entry.file_name());
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => {
-                    stack.push((host_entry, logical_entry));
-                }
-                Ok(ft) if ft.is_file() || ft.is_symlink() => {
-                    let destination = payload_path_for(&logical_entry);
-                    if existing.contains(&destination) {
-                        continue;
-                    }
-                    let digest = compute_digest(&host_entry).with_context(|| {
-                        format!("failed to hash glibc-hwcaps file {}", host_entry.display())
-                    })?;
-                    debug!(
-                        "adding glibc-hwcaps {} -> {}",
-                        host_entry.display(),
-                        destination.display()
-                    );
-                    closure.files.push(ResolvedFile {
-                        source: host_entry.clone(),
-                        destination: destination.clone(),
-                        digest,
-                    });
-                    mark_existing(existing, &destination);
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn copy_symlink(
-    closure: &mut DependencyClosure,
-    logical_path: &Path,
-    source: &Path,
-    destination: &Path,
-    existing: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    let target = fs::read_link(source)
-        .with_context(|| format!("failed to read hwcaps symlink {}", source.display()))?;
-    record_symlink_target(closure, logical_path, destination, &target, existing)
-}
-
-fn record_symlink_target(
-    closure: &mut DependencyClosure,
-    logical_path: &Path,
-    destination: &Path,
-    target: &Path,
-    existing: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    if existing.contains(destination) {
-        return Ok(());
-    }
-    let runtime_target = normalize_symlink_runtime_target(logical_path, target);
-    let bundle_target = payload_path_for(&runtime_target);
-    closure.symlinks.push(ResolvedSymlink::new(
-        destination.to_path_buf(),
-        bundle_target,
-    ));
-    mark_existing(existing, destination);
-    Ok(())
-}
-
-fn normalize_symlink_runtime_target(logical_path: &Path, target: &Path) -> PathBuf {
-    let absolute = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        let parent = logical_path.parent().unwrap_or_else(|| Path::new("/"));
-        let mut base = if parent.is_absolute() {
-            parent.to_path_buf()
-        } else {
-            let mut rooted = PathBuf::from("/");
-            rooted.push(parent);
-            rooted
-        };
-        base.push(target);
-        base
-    };
-    clean_absolute_path(absolute)
-}
-
-fn clean_absolute_path(path: PathBuf) -> PathBuf {
-    use std::path::Component;
-    let mut absolute = false;
-    let mut parts: Vec<std::ffi::OsString> = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => {
-                absolute = true;
-                parts.clear();
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !parts.is_empty() {
-                    parts.pop();
-                }
-            }
-            Component::Normal(segment) => parts.push(segment.to_os_string()),
-            _ => {}
-        }
-    }
-    let mut result = if absolute {
-        PathBuf::from("/")
-    } else {
-        PathBuf::new()
-    };
-    for part in parts {
-        result.push(part);
-    }
-    if result.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else if result.is_absolute() {
-        result
-    } else {
-        let mut abs = PathBuf::from("/");
-        abs.push(result);
-        abs
-    }
-}
-
 fn mark_existing(existing: &mut HashSet<PathBuf>, path: &Path) {
     let mut current = path.to_path_buf();
     loop {
@@ -890,18 +659,6 @@ const SYSTEM_ASSET_PATHS: &[&str] = &[
     "/etc/nsswitch.conf",
     "/etc/resolv.conf",
     "/etc/hosts",
-];
-
-const GLIBC_HWCAPS_DIRS: &[&str] = &[
-    "/lib/glibc-hwcaps",
-    "/lib64/glibc-hwcaps",
-    "/lib/x86_64-linux-gnu/glibc-hwcaps",
-    "/lib64/x86_64-linux-gnu/glibc-hwcaps",
-    "/usr/lib/glibc-hwcaps",
-    "/usr/lib/x86_64-linux-gnu/glibc-hwcaps",
-    "/usr/lib64/glibc-hwcaps",
-    "/usr/lib64/x86_64-linux-gnu/glibc-hwcaps",
-    "/usr/bin/glibc-hwcaps",
 ];
 
 fn build_image_closure(
