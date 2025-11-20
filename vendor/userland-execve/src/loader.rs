@@ -1,6 +1,6 @@
 use goblin::{
     elf::{self, Elf},
-    elf64::program_header::PT_LOAD,
+    elf64::{program_header::PT_LOAD, reloc::R_X86_64_RELATIVE},
 };
 use nix::{
     sys::mman::{mmap, MapFlags, ProtFlags},
@@ -49,29 +49,32 @@ pub fn load(
         .unwrap()
         .p_vaddr
         == 0;
-    assert!(is_pie);
-    let total_size: usize = elf
-        .program_headers
-        .iter()
-        .filter(|h| h.p_type == PT_LOAD)
-        .map(|h| h.p_vaddr + h.p_memsz)
-        .max()
-        .unwrap()
-        .try_into()
+    let base_addr = if is_pie {
+        let total_size: usize = elf
+            .program_headers
+            .iter()
+            .filter(|h| h.p_type == PT_LOAD)
+            .map(|h| h.p_vaddr + h.p_memsz)
+            .max()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let total_size = NonZeroUsize::new(total_size).unwrap();
+        let base_ptr = unsafe {
+            mmap::<BorrowedFd>(
+                None,
+                total_size,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE, // TODO: read only fix
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                None,
+                0,
+            )
+        }
         .unwrap();
-    let total_size = NonZeroUsize::new(total_size).unwrap();
-    let base_ptr = unsafe {
-        mmap::<BorrowedFd>(
-            None,
-            total_size,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE, // TODO: read only fix
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-            None,
-            0,
-        )
-    }
-    .unwrap();
-    let base_addr = base_ptr as usize;
+        base_ptr as usize
+    } else {
+        0
+    };
 
     let page_size: usize = sysconf(SysconfVar::PAGE_SIZE)
         .unwrap()
@@ -100,9 +103,10 @@ pub fn load(
         let offset = offset - align_dist;
         let offset = offset.try_into().unwrap();
         let addr = NonZeroUsize::new(addr).unwrap();
+        let mapping_addr = Some(addr);
         unsafe {
             mmap(
-                Some(addr),
+                mapping_addr,
                 size,
                 prot | ProtFlags::PROT_WRITE, // TODO: read only fix
                 MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
@@ -121,13 +125,26 @@ pub fn load(
         }
     }
 
-    // Relocations (needed for musl but not glibc FWICT)
     for rel in elf.dynrelas.iter() {
+        if rel.r_type != R_X86_64_RELATIVE as u32 {
+            continue;
+        }
         let offset: usize = rel.r_offset.try_into().unwrap();
         let addend: usize = rel.r_addend.unwrap().try_into().unwrap();
         let dst = (base_addr + offset) as *mut usize;
         let src = base_addr + addend;
         unsafe { ptr::write(dst, src) }
+    }
+    for rel in elf.dynrels.iter() {
+        if rel.r_type != R_X86_64_RELATIVE as u32 {
+            continue;
+        }
+        let offset: usize = rel.r_offset.try_into().unwrap();
+        let dst = (base_addr + offset) as *mut usize;
+        unsafe {
+            let value = ptr::read(dst);
+            ptr::write(dst, base_addr + value);
+        }
     }
 
     (base_addr, elf.header, opt_interp)
