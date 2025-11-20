@@ -36,20 +36,32 @@ pub fn write_launchers(
     })?;
 
     for plan in plans {
-        let runtime = metadata.get(&plan.origin).cloned();
+        let runtime = metadata.get(plan.origin()).cloned();
         write_config(&config_dir, plan, runtime)?;
-        link_entry(&bin_dir, plan)?;
+        link_entry(&bin_dir, plan.display_name())?;
     }
     Ok(())
 }
 
 #[derive(Serialize)]
-struct LauncherConfig {
-    dynamic: bool,
-    binary: PathBuf,
-    linker: Option<PathBuf>,
-    library_paths: Vec<PathBuf>,
-    metadata: Option<RuntimeMetadata>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LauncherConfig {
+    Binary {
+        dynamic: bool,
+        binary: PathBuf,
+        linker: Option<PathBuf>,
+        library_paths: Vec<PathBuf>,
+        metadata: Option<RuntimeMetadata>,
+    },
+    Script {
+        dynamic: bool,
+        interpreter: PathBuf,
+        script: PathBuf,
+        args: Vec<String>,
+        linker: Option<PathBuf>,
+        library_paths: Vec<PathBuf>,
+        metadata: Option<RuntimeMetadata>,
+    },
 }
 
 fn write_config(
@@ -57,17 +69,32 @@ fn write_config(
     plan: &EntryBundlePlan,
     metadata: Option<RuntimeMetadata>,
 ) -> Result<(), PackagerError> {
-    let config_path = dir.join(format!("{}.{}", plan.display_name, CONFIG_EXT));
-    let config = LauncherConfig {
-        dynamic: plan.requires_linker,
-        binary: plan.binary_destination.clone(),
-        linker: if plan.requires_linker {
-            Some(plan.linker_destination.clone())
-        } else {
-            None
+    let config_path = dir.join(format!("{}.{}", plan.display_name(), CONFIG_EXT));
+    let config = match plan {
+        EntryBundlePlan::Binary(plan) => LauncherConfig::Binary {
+            dynamic: plan.requires_linker,
+            binary: plan.binary_destination.clone(),
+            linker: if plan.requires_linker {
+                Some(plan.linker_destination.clone())
+            } else {
+                None
+            },
+            library_paths: plan.library_dirs.clone(),
+            metadata,
         },
-        library_paths: plan.library_dirs.clone(),
-        metadata,
+        EntryBundlePlan::Script(plan) => LauncherConfig::Script {
+            dynamic: plan.requires_linker,
+            interpreter: plan.interpreter_destination.clone(),
+            script: plan.script_destination.clone(),
+            args: plan.interpreter_args.clone(),
+            linker: if plan.requires_linker {
+                Some(plan.linker_destination.clone())
+            } else {
+                None
+            },
+            library_paths: plan.library_dirs.clone(),
+            metadata: inject_script_metadata(plan, metadata),
+        },
     };
     let data = serde_json::to_vec_pretty(&config).map_err(PackagerError::Manifest)?;
     fs::write(&config_path, data).map_err(|source| PackagerError::Io {
@@ -77,8 +104,8 @@ fn write_config(
     Ok(())
 }
 
-fn link_entry(bin_dir: &Path, plan: &EntryBundlePlan) -> Result<(), PackagerError> {
-    let entry_path = bin_dir.join(&plan.display_name);
+fn link_entry(bin_dir: &Path, name: &str) -> Result<(), PackagerError> {
+    let entry_path = bin_dir.join(name);
     if entry_path.exists() {
         fs::remove_file(&entry_path).map_err(|source| PackagerError::Io {
             path: entry_path.clone(),
@@ -123,4 +150,35 @@ fn set_exec_permissions(path: &Path) -> Result<(), PackagerError> {
         })?;
     }
     Ok(())
+}
+
+fn inject_script_metadata(
+    plan: &sidebundle_core::ScriptEntryPlan,
+    metadata: Option<RuntimeMetadata>,
+) -> Option<RuntimeMetadata> {
+    if !is_node_interpreter(&plan.interpreter_destination) {
+        return metadata;
+    }
+    let mut metadata = metadata.unwrap_or_default();
+    let opts = metadata
+        .env
+        .entry("NODE_OPTIONS".into())
+        .or_default();
+    const FLAGS: &[&str] = &["--preserve-symlinks-main", "--preserve-symlinks"];
+    for flag in FLAGS {
+        if !opts.split_whitespace().any(|existing| existing == *flag) {
+            if !opts.is_empty() {
+                opts.push(' ');
+            }
+            opts.push_str(flag);
+        }
+    }
+    Some(metadata)
+}
+
+fn is_node_interpreter(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| matches!(name, "node" | "nodejs"))
+        .unwrap_or(false)
 }

@@ -34,31 +34,74 @@ fn run() -> Result<()> {
         .into_owned();
 
     let config = load_config(bundle_root, &entry_name)?;
-    let entry_path = bundle_root.join(&config.binary);
-    let argv = build_argv(&entry_path)?;
-    let env_block = build_env_block(bundle_root, &config)?;
-
-    if !config.dynamic {
-        exec_static(&entry_path, &argv, &env_block)?;
-        unreachable!();
+    match config {
+        LauncherConfig::Binary {
+            dynamic,
+            binary,
+            linker,
+            library_paths,
+            metadata,
+        } => {
+            let entry_path = bundle_root.join(&binary);
+            let argv = build_binary_argv(&entry_path)?;
+            let env_block = build_env_block(bundle_root, &library_paths, metadata.as_ref())?;
+            if !dynamic {
+                exec_static(&entry_path, &argv, &env_block)?;
+                unreachable!();
+            }
+            let linker = linker
+                .as_ref()
+                .map(|rel| bundle_root.join(rel))
+                .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+            exec_dynamic(&linker, &entry_path, &argv, &env_block)?;
+            unreachable!();
+        }
+        LauncherConfig::Script {
+            dynamic,
+            interpreter,
+            script,
+            args,
+            linker,
+            library_paths,
+            metadata,
+        } => {
+            let interpreter_path = bundle_root.join(&interpreter);
+            let script_path = bundle_root.join(&script);
+            let argv = build_script_argv(&interpreter_path, &script_path, &args)?;
+            let env_block = build_env_block(bundle_root, &library_paths, metadata.as_ref())?;
+            if !dynamic {
+                exec_static(&interpreter_path, &argv, &env_block)?;
+                unreachable!();
+            }
+            let linker = linker
+                .as_ref()
+                .map(|rel| bundle_root.join(rel))
+                .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+            exec_dynamic(&linker, &interpreter_path, &argv, &env_block)?;
+            unreachable!();
+        }
     }
-
-    let linker = config
-        .linker
-        .as_ref()
-        .map(|rel| bundle_root.join(rel))
-        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
-    exec_dynamic(&linker, &entry_path, &argv, &env_block)?;
-    unreachable!();
 }
 
 #[derive(Deserialize)]
-struct LauncherConfig {
-    dynamic: bool,
-    binary: PathBuf,
-    linker: Option<PathBuf>,
-    library_paths: Vec<PathBuf>,
-    metadata: Option<RuntimeMetadata>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LauncherConfig {
+    Binary {
+        dynamic: bool,
+        binary: PathBuf,
+        linker: Option<PathBuf>,
+        library_paths: Vec<PathBuf>,
+        metadata: Option<RuntimeMetadata>,
+    },
+    Script {
+        dynamic: bool,
+        interpreter: PathBuf,
+        script: PathBuf,
+        args: Vec<String>,
+        linker: Option<PathBuf>,
+        library_paths: Vec<PathBuf>,
+        metadata: Option<RuntimeMetadata>,
+    },
 }
 
 fn load_config(bundle_root: &Path, entry_name: &str) -> Result<LauncherConfig> {
@@ -71,7 +114,7 @@ fn load_config(bundle_root: &Path, entry_name: &str) -> Result<LauncherConfig> {
         .with_context(|| format!("invalid launcher config {}", path.display()))
 }
 
-fn build_argv(entry: &Path) -> Result<Vec<CString>> {
+fn build_binary_argv(entry: &Path) -> Result<Vec<CString>> {
     let mut argv = Vec::new();
     argv.push(os_to_cstring(entry.as_os_str())?);
     for arg in env::args_os().skip(1) {
@@ -80,20 +123,35 @@ fn build_argv(entry: &Path) -> Result<Vec<CString>> {
     Ok(argv)
 }
 
-fn build_env_block(bundle_root: &Path, config: &LauncherConfig) -> Result<Vec<CString>> {
-    let mut env_map: BTreeMap<String, String> = config
-        .metadata
-        .as_ref()
-        .map(|meta| meta.env.clone())
+fn build_script_argv(interpreter: &Path, script: &Path, args: &[String]) -> Result<Vec<CString>> {
+    let mut argv = Vec::new();
+    argv.push(os_to_cstring(interpreter.as_os_str())?);
+    for arg in args {
+        argv.push(CString::new(arg.as_bytes()).map_err(|err| anyhow!("invalid arg: {err}"))?);
+    }
+    argv.push(os_to_cstring(script.as_os_str())?);
+    for arg in env::args_os().skip(1) {
+        argv.push(os_to_cstring(&arg)?);
+    }
+    Ok(argv)
+}
+
+fn build_env_block(
+    bundle_root: &Path,
+    library_paths: &[PathBuf],
+    metadata: Option<&RuntimeMetadata>,
+) -> Result<Vec<CString>> {
+    let mut env_map: BTreeMap<String, String> = metadata
+        .cloned()
+        .map(|meta| meta.env)
         .unwrap_or_else(|| env::vars().collect());
     env_map.insert(
         "SIDEBUNDLE_ROOT".into(),
         bundle_root.to_string_lossy().into_owned(),
     );
 
-    if !config.library_paths.is_empty() {
-        let joined = config
-            .library_paths
+    if !library_paths.is_empty() {
+        let joined = library_paths
             .iter()
             .map(|path| bundle_root.join(path).to_string_lossy().into_owned())
             .collect::<Vec<_>>()

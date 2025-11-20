@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use log::{debug, info};
 
 use crate::linker::{LinkerError, LinkerRunner};
-use sidebundle_core::EntryBundlePlan;
+use sidebundle_core::{BinaryEntryPlan, EntryBundlePlan, ScriptEntryPlan};
 use thiserror::Error;
 
 /// Revalidates bundle contents by re-running the linker against packaged entries.
@@ -64,6 +64,13 @@ impl BundleValidator {
     }
 
     fn inspect_entry(&self, bundle_root: &Path, plan: &EntryBundlePlan) -> EntryValidation {
+        match plan {
+            EntryBundlePlan::Binary(plan) => self.inspect_binary(bundle_root, plan),
+            EntryBundlePlan::Script(plan) => self.inspect_script(bundle_root, plan),
+        }
+    }
+
+    fn inspect_binary(&self, bundle_root: &Path, plan: &BinaryEntryPlan) -> EntryValidation {
         let binary_path = bundle_root.join(&plan.binary_destination);
         let mut validation = EntryValidation {
             display_name: plan.display_name.clone(),
@@ -99,6 +106,56 @@ impl BundleValidator {
         match self
             .runner
             .trace_dependencies(&linker_path, &binary_path, &search_paths)
+        {
+            Ok(resolved) => {
+                validation.status = EntryValidationStatus::DynamicOk {
+                    resolved: resolved.len(),
+                };
+            }
+            Err(err) => {
+                validation.status = EntryValidationStatus::LinkerError {
+                    error: LinkerFailure::from(err),
+                };
+            }
+        }
+        validation
+    }
+
+    fn inspect_script(&self, bundle_root: &Path, plan: &ScriptEntryPlan) -> EntryValidation {
+        let script_path = bundle_root.join(&plan.script_destination);
+        let mut validation = EntryValidation {
+            display_name: plan.display_name.clone(),
+            binary_path: script_path.clone(),
+            status: EntryValidationStatus::MissingBinary,
+        };
+
+        if !script_path.exists() {
+            validation.status = EntryValidationStatus::MissingBinary;
+            return validation;
+        }
+        let interpreter_path = bundle_root.join(&plan.interpreter_destination);
+        if !interpreter_path.exists() {
+            validation.status = EntryValidationStatus::MissingInterpreter;
+            return validation;
+        }
+        if !plan.requires_linker {
+            validation.status = EntryValidationStatus::StaticOk;
+            return validation;
+        }
+        let linker_path = bundle_root.join(&plan.linker_destination);
+        if !linker_path.exists() {
+            validation.status = EntryValidationStatus::MissingLinker;
+            return validation;
+        }
+        let search_paths: Vec<PathBuf> = plan
+            .library_dirs
+            .iter()
+            .map(|dir| bundle_root.join(dir))
+            .collect();
+
+        match self
+            .runner
+            .trace_dependencies(&linker_path, &interpreter_path, &search_paths)
         {
             Ok(resolved) => {
                 validation.status = EntryValidationStatus::DynamicOk {
@@ -163,6 +220,7 @@ pub enum EntryValidationStatus {
     DynamicOk { resolved: usize },
     MissingBinary,
     MissingLinker,
+    MissingInterpreter,
     LinkerError { error: LinkerFailure },
 }
 
@@ -229,7 +287,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn dummy_plan(require_linker: bool) -> EntryBundlePlan {
-        EntryBundlePlan {
+        EntryBundlePlan::Binary(BinaryEntryPlan {
             display_name: "demo".into(),
             binary_source: PathBuf::from("/bin/echo"),
             binary_destination: PathBuf::from("payload/bin/demo"),
@@ -238,7 +296,7 @@ mod tests {
             library_dirs: vec![PathBuf::from("payload/lib64")],
             requires_linker: require_linker,
             origin: Origin::Host,
-        }
+        })
     }
 
     #[test]

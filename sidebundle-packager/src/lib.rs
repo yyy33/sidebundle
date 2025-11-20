@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -86,6 +86,16 @@ impl Packager {
         } else {
             HashMap::new()
         };
+        let script_targets: HashSet<PathBuf> = closure
+            .entry_plans
+            .iter()
+            .filter_map(|plan| match plan {
+                sidebundle_core::EntryBundlePlan::Script(script) => {
+                    Some(script.script_destination.clone())
+                }
+                _ => None,
+            })
+            .collect();
         let traced_queue: Vec<TracedFile> = closure.traced_files.clone();
 
         for file in &closure.files {
@@ -105,7 +115,8 @@ impl Packager {
             let stored = store_in_data(&data_dir, &file.source, &file.digest)?;
 
             let dest_path = bundle_root.join(&file.destination);
-            link_or_copy(&stored, &dest_path)?;
+            let force_copy = script_targets.contains(&file.destination);
+            link_or_copy(&stored, &dest_path, !force_copy)?;
             manifest_files.push(ManifestFile {
                 origin: FileOrigin::Dependency,
                 source: file.source.display().to_string(),
@@ -213,7 +224,7 @@ impl Packager {
             let stored = store_in_data(&data_dir, &source_path, &digest)?;
             let destination = traced_destination(&traced.original);
             let dest_path = bundle_root.join(&destination);
-            link_or_copy(&stored, &dest_path)?;
+            link_or_copy(&stored, &dest_path, true)?;
             traced_manifest.push(ManifestFile {
                 origin: FileOrigin::Trace,
                 source: traced.original.display().to_string(),
@@ -302,7 +313,7 @@ fn store_in_data(data_dir: &Path, source: &Path, digest: &str) -> Result<PathBuf
     Ok(stored)
 }
 
-fn link_or_copy(stored: &Path, dest: &Path) -> Result<(), PackagerError> {
+fn link_or_copy(stored: &Path, dest: &Path, allow_symlink: bool) -> Result<(), PackagerError> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
             path: parent.to_path_buf(),
@@ -315,13 +326,15 @@ fn link_or_copy(stored: &Path, dest: &Path) -> Result<(), PackagerError> {
             source,
         })?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        if let Some(parent) = dest.parent() {
-            if let Some(relative) = diff_paths(stored, parent) {
-                if symlink(&relative, dest).is_ok() {
-                    return Ok(());
+    if allow_symlink {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            if let Some(parent) = dest.parent() {
+                if let Some(relative) = diff_paths(stored, parent) {
+                    if symlink(&relative, dest).is_ok() {
+                        return Ok(());
+                    }
                 }
             }
         }

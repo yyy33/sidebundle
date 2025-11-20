@@ -1287,6 +1287,7 @@ fn describe_status(status: &EntryValidationStatus) -> String {
             format!("dynamic entry (resolved {} libs)", resolved)
         }
         EntryValidationStatus::MissingBinary => "binary missing".to_string(),
+        EntryValidationStatus::MissingInterpreter => "interpreter missing".to_string(),
         EntryValidationStatus::MissingLinker => "linker missing".to_string(),
         EntryValidationStatus::LinkerError { error } => match error {
             LinkerFailure::Spawn { linker, message } => {

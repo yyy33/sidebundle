@@ -240,7 +240,13 @@ impl ResolvedFile {
 
 /// 针对单个入口生成 launcher 所需的信息。
 #[derive(Debug, Clone)]
-pub struct EntryBundlePlan {
+pub enum EntryBundlePlan {
+    Binary(BinaryEntryPlan),
+    Script(ScriptEntryPlan),
+}
+
+#[derive(Debug, Clone)]
+pub struct BinaryEntryPlan {
     pub display_name: String,
     pub binary_source: PathBuf,
     pub binary_destination: PathBuf,
@@ -249,6 +255,37 @@ pub struct EntryBundlePlan {
     pub library_dirs: Vec<PathBuf>,
     pub requires_linker: bool,
     pub origin: Origin,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScriptEntryPlan {
+    pub display_name: String,
+    pub script_source: PathBuf,
+    pub script_destination: PathBuf,
+    pub interpreter_source: PathBuf,
+    pub interpreter_destination: PathBuf,
+    pub linker_source: PathBuf,
+    pub linker_destination: PathBuf,
+    pub interpreter_args: Vec<String>,
+    pub library_dirs: Vec<PathBuf>,
+    pub requires_linker: bool,
+    pub origin: Origin,
+}
+
+impl EntryBundlePlan {
+    pub fn display_name(&self) -> &str {
+        match self {
+            EntryBundlePlan::Binary(plan) => &plan.display_name,
+            EntryBundlePlan::Script(plan) => &plan.display_name,
+        }
+    }
+
+    pub fn origin(&self) -> &Origin {
+        match self {
+            EntryBundlePlan::Binary(plan) => &plan.origin,
+            EntryBundlePlan::Script(plan) => &plan.origin,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -297,7 +334,7 @@ impl DependencyClosure {
         let mut seen_entry_names: HashSet<String> = self
             .entry_plans
             .iter()
-            .map(|plan| plan.display_name.clone())
+            .map(|plan| plan.display_name().to_string())
             .collect();
         let mut traced_set: HashSet<PathBuf> = self
             .traced_files
@@ -335,7 +372,7 @@ impl DependencyClosure {
         }
 
         for plan in other.entry_plans {
-            if seen_entry_names.insert(plan.display_name.clone()) {
+            if seen_entry_names.insert(plan.display_name().to_string()) {
                 report.added_entries += 1;
                 self.entry_plans.push(plan);
             } else {

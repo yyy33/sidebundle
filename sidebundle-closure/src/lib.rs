@@ -8,16 +8,17 @@ use log::warn;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use linker::{LibraryResolution, LinkerError, LinkerRunner};
 use log::debug;
 use sha2::{Digest, Sha256};
+use shell_words;
 use sidebundle_core::{
-    parse_elf_metadata, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata, ElfParseError,
-    EntryBundlePlan, LogicalPath, Origin, ResolvedFile, TracedFile,
+    parse_elf_metadata, BinaryEntryPlan, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata,
+    ElfParseError, EntryBundlePlan, LogicalPath, Origin, ResolvedFile, ScriptEntryPlan, TracedFile,
 };
 use thiserror::Error;
 
@@ -28,6 +29,15 @@ const DEFAULT_LIBRARY_DIRS: &[&str] = &[
     "/usr/lib64",
     "/usr/lib/x86_64-linux-gnu",
     "/usr/local/lib",
+];
+
+const DEFAULT_SHEBANG_PATHS: &[&str] = &[
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
 ];
 
 const TRACE_SKIP_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run"];
@@ -48,6 +58,11 @@ const GPU_LIB_PREFIXES: &[&str] = &[
     "libopenvr",
     "libxnvctrl",
 ];
+
+struct ShebangSpec {
+    interpreter_host: PathBuf,
+    args: Vec<String>,
+}
 
 pub trait PathResolver: Send + Sync {
     fn trace_root(&self) -> Option<&Path>;
@@ -251,30 +266,28 @@ impl ClosureBuilder {
                 &mut runtime_aliases,
                 &mut elf_cache,
             )?;
-            entry_plans.push(plan);
             if let Some(tracer) = &self.tracer {
-                let mut command = trace::TraceCommand::new(entry.logical.clone());
-                if let Some(args) = &entry.trace_args {
-                    command = command.with_args(args.clone());
-                }
-                match tracer.run(resolver.as_ref(), &command) {
-                    Ok(artifacts) => {
-                        let origin = entry.logical.origin().clone();
-                        let origin_map = traced_map.entry(origin).or_default();
-                        for record in artifacts {
-                            if let Some(artifact) = self.make_trace_artifact(&record) {
-                                origin_map
-                                    .entry(artifact.resolved.clone())
-                                    .or_insert(artifact);
+                if let Some(command) = self.trace_command_for(entry, &plan, resolver.as_ref()) {
+                    match tracer.run(resolver.as_ref(), &command) {
+                        Ok(artifacts) => {
+                            let origin = plan.origin().clone();
+                            let origin_map = traced_map.entry(origin).or_default();
+                            for record in artifacts {
+                                if let Some(artifact) = self.make_trace_artifact(&record) {
+                                    origin_map
+                                        .entry(artifact.resolved.clone())
+                                        .or_insert(artifact);
+                                }
                             }
                         }
+                        Err(err) => debug!(
+                            "trace for `{}` failed: {err}",
+                            entry.logical.path().display()
+                        ),
                     }
-                    Err(err) => debug!(
-                        "trace for `{}` failed: {err}",
-                        entry.logical.path().display()
-                    ),
                 }
             }
+            entry_plans.push(plan);
         }
 
         for (origin, runtime_paths) in &self.external_traces {
@@ -481,6 +494,74 @@ impl ClosureBuilder {
         aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
+        match parse_elf_metadata(entry_source) {
+            Ok(metadata) => {
+                cache
+                    .entry(entry_source.to_path_buf())
+                    .or_insert_with(|| metadata.clone());
+                let plan = self.build_binary_plan(
+                    resolver,
+                    origin,
+                    entry_source,
+                    display_name,
+                    files,
+                    aliases,
+                    cache,
+                )?;
+                Ok(EntryBundlePlan::Binary(plan))
+            }
+            Err(ElfParseError::NotElf { .. }) => {
+                let shebang = self.parse_shebang(entry_source, resolver, origin)?;
+                let interpreter_plan = self.build_binary_plan(
+                    resolver,
+                    origin,
+                    &shebang.interpreter_host,
+                    display_name,
+                    files,
+                    aliases,
+                    cache,
+                )?;
+                let runtime_alias = resolver
+                    .host_to_logical(entry_source)
+                    .map(|logical| logical.path().to_path_buf());
+                let script_destination = ensure_file(
+                    resolver,
+                    files,
+                    aliases,
+                    entry_source,
+                    runtime_alias.as_deref(),
+                );
+                Ok(EntryBundlePlan::Script(ScriptEntryPlan {
+                    display_name: display_name.to_string(),
+                    script_source: entry_source.to_path_buf(),
+                    script_destination,
+                    interpreter_source: interpreter_plan.binary_source.clone(),
+                    interpreter_destination: interpreter_plan.binary_destination.clone(),
+                    linker_source: interpreter_plan.linker_source.clone(),
+                    linker_destination: interpreter_plan.linker_destination.clone(),
+                    interpreter_args: shebang.args,
+                    library_dirs: interpreter_plan.library_dirs.clone(),
+                    requires_linker: interpreter_plan.requires_linker,
+                    origin: origin.clone(),
+                }))
+            }
+            Err(source) => Err(ClosureError::ElfParse {
+                path: entry_source.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    fn build_binary_plan(
+        &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        entry_source: &Path,
+        display_name: &str,
+        files: &mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+        cache: &mut HashMap<PathBuf, ElfMetadata>,
+    ) -> Result<BinaryEntryPlan, ClosureError> {
         let entry_metadata = self.load_metadata(entry_source, cache)?;
         let entry_dest = ensure_file(resolver, files, aliases, entry_source, None);
 
@@ -542,6 +623,15 @@ impl ClosureBuilder {
                 );
                 if let Some(dir) = dest.parent() {
                     lib_dirs.insert(dir.to_path_buf());
+                    let mut alias_path = dir.to_path_buf();
+                    alias_path.push(&resolution.name);
+                    if let Some(logical) = resolver.host_to_logical(&canonical) {
+                        let mut runtime_alias = logical.path().to_path_buf();
+                        runtime_alias.set_file_name(&resolution.name);
+                        record_alias(aliases, &canonical, &runtime_alias);
+                    } else if alias_path != dest {
+                        record_alias(aliases, &canonical, &alias_path);
+                    }
                 }
                 queue.push_back(canonical);
             }
@@ -549,7 +639,7 @@ impl ClosureBuilder {
 
         let libraries: Vec<PathBuf> = lib_dirs.into_iter().collect();
         let binary_destination = entry_dest.clone();
-        Ok(EntryBundlePlan {
+        Ok(BinaryEntryPlan {
             display_name: display_name.to_string(),
             binary_source: entry_source.to_path_buf(),
             binary_destination: binary_destination.clone(),
@@ -559,6 +649,172 @@ impl ClosureBuilder {
             requires_linker: !is_static,
             origin: origin.clone(),
         })
+    }
+
+    fn parse_shebang(
+        &self,
+        script: &Path,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+    ) -> Result<ShebangSpec, ClosureError> {
+        let file = fs::File::open(script).map_err(|source| ClosureError::Io {
+            path: script.to_path_buf(),
+            source,
+        })?;
+        let mut reader = BufReader::new(file);
+        let mut first_line = String::new();
+        let _ = reader
+            .read_line(&mut first_line)
+            .map_err(|source| ClosureError::Io {
+                path: script.to_path_buf(),
+                source,
+            })?;
+        let trimmed = first_line.trim_end_matches(&['\r', '\n'][..]);
+        if !trimmed.starts_with("#!") {
+            return Err(ClosureError::UnsupportedEntry {
+                path: script.to_path_buf(),
+            });
+        }
+        let parts = shell_words::split(trimmed.trim_start_matches("#!").trim()).map_err(|err| {
+            ClosureError::ShebangParse {
+                path: script.to_path_buf(),
+                reason: format!("failed to parse shebang tokens: {err}"),
+            }
+        })?;
+        if parts.is_empty() {
+            return Err(ClosureError::ShebangParse {
+                path: script.to_path_buf(),
+                reason: "shebang missing interpreter".into(),
+            });
+        }
+
+        let mut iter = parts.into_iter();
+        let raw_interpreter = iter
+            .next()
+            .expect("split ensured at least one token exists");
+        let remaining: Vec<String> = iter.collect();
+        if Self::is_env_invocation(&raw_interpreter) {
+            self.resolve_env_interpreter(script, resolver, origin, raw_interpreter, remaining)
+        } else {
+            self.resolve_direct_interpreter(script, resolver, origin, raw_interpreter, remaining)
+        }
+    }
+
+    fn resolve_direct_interpreter(
+        &self,
+        script: &Path,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        interpreter: String,
+        args: Vec<String>,
+    ) -> Result<ShebangSpec, ClosureError> {
+        let candidate = PathBuf::from(&interpreter);
+        if !candidate.is_absolute() {
+            return Err(ClosureError::ShebangParse {
+                path: script.to_path_buf(),
+                reason: "interpreter path must be absolute".into(),
+            });
+        }
+        if let Some(resolved) = self.resolve_in_origin(resolver, origin, &candidate) {
+            Ok(ShebangSpec {
+                interpreter_host: resolved,
+                args,
+            })
+        } else {
+            Err(ClosureError::InterpreterNotFound {
+                script: script.to_path_buf(),
+                interpreter,
+            })
+        }
+    }
+
+    fn resolve_env_interpreter(
+        &self,
+        script: &Path,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        interpreter: String,
+        mut args: Vec<String>,
+    ) -> Result<ShebangSpec, ClosureError> {
+        if args.is_empty() {
+            return Err(ClosureError::ShebangParse {
+                path: script.to_path_buf(),
+                reason: format!("{interpreter} requires a command to execute"),
+            });
+        }
+        let command = args.remove(0);
+        if command.starts_with('-') {
+            return Err(ClosureError::ShebangParse {
+                path: script.to_path_buf(),
+                reason: format!("env-style shebang flags are not supported (saw `{command}`)"),
+            });
+        }
+        if let Some(resolved) = self.resolve_command(resolver, origin, &command) {
+            Ok(ShebangSpec {
+                interpreter_host: resolved,
+                args,
+            })
+        } else {
+            Err(ClosureError::InterpreterNotFound {
+                script: script.to_path_buf(),
+                interpreter: command,
+            })
+        }
+    }
+
+    fn resolve_command(
+        &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        command: &str,
+    ) -> Option<PathBuf> {
+        let candidate = PathBuf::from(command);
+        if candidate.components().count() > 1 || candidate.is_absolute() {
+            return self.resolve_in_origin(resolver, origin, &candidate);
+        }
+        let search_paths = self.shebang_path_entries();
+        for dir in search_paths {
+            let joined = dir.join(command);
+            if let Some(resolved) = self.resolve_in_origin(resolver, origin, &joined) {
+                return Some(resolved);
+            }
+        }
+        None
+    }
+
+    fn resolve_in_origin(
+        &self,
+        resolver: &dyn PathResolver,
+        origin: &Origin,
+        candidate: &Path,
+    ) -> Option<PathBuf> {
+        let logical = LogicalPath::new(origin.clone(), candidate.to_path_buf());
+        let host = resolver.to_host(&logical);
+        match fs::metadata(&host) {
+            Ok(meta) if meta.is_file() => {}
+            _ => return None,
+        }
+        canonicalize(&host, resolver.trace_root()).ok()
+    }
+
+    fn shebang_path_entries(&self) -> Vec<PathBuf> {
+        env::var("PATH")
+            .ok()
+            .map(|value| Self::split_paths(&value))
+            .unwrap_or_else(|| {
+                DEFAULT_SHEBANG_PATHS
+                    .iter()
+                    .map(|entry| PathBuf::from(entry))
+                    .collect()
+            })
+    }
+
+    fn is_env_invocation(interpreter: &str) -> bool {
+        let path = Path::new(interpreter);
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some("env") => true,
+            _ => false,
+        }
     }
 
     fn load_metadata<'a>(
@@ -672,6 +928,33 @@ impl ClosureBuilder {
             .filter(|segment| !segment.trim().is_empty())
             .map(PathBuf::from)
             .collect()
+    }
+
+    fn trace_command_for(
+        &self,
+        entry: &BundleEntry,
+        plan: &EntryBundlePlan,
+        resolver: &dyn PathResolver,
+    ) -> Option<trace::TraceCommand> {
+        match plan {
+            EntryBundlePlan::Binary(_) => {
+                let mut command = trace::TraceCommand::new(entry.logical.clone());
+                if let Some(args) = &entry.trace_args {
+                    command = command.with_args(args.clone());
+                }
+                Some(command)
+            }
+            EntryBundlePlan::Script(script) => {
+                let interpreter_logical = resolver.host_to_logical(&script.interpreter_source)?;
+                let script_runtime = resolver.to_trace_path(&entry.logical);
+                let mut args = script.interpreter_args.clone();
+                args.push(script_runtime.display().to_string());
+                if let Some(extra) = &entry.trace_args {
+                    args.extend(extra.clone());
+                }
+                Some(trace::TraceCommand::new(interpreter_logical).with_args(args))
+            }
+        }
     }
 }
 
@@ -857,6 +1140,15 @@ pub enum ClosureError {
         path: PathBuf,
         source: ElfParseError,
     },
+    #[error("unsupported entry {path}: expected ELF or shebang script")]
+    UnsupportedEntry { path: PathBuf },
+    #[error("failed to parse shebang for {path}: {reason}")]
+    ShebangParse { path: PathBuf, reason: String },
+    #[error("interpreter `{interpreter}` not found for script {script}")]
+    InterpreterNotFound {
+        script: PathBuf,
+        interpreter: String,
+    },
     #[error("binary {path} lacks PT_INTERP linker")]
     MissingInterpreter { path: PathBuf },
     #[error("linker trace failed for {path}: {source}")]
@@ -886,7 +1178,7 @@ mod tests {
                 closure
                     .entry_plans
                     .iter()
-                    .any(|plan| plan.display_name == "ls"),
+                    .any(|plan| plan.display_name() == "ls"),
                 "entry plan should include launcher info"
             );
         }
