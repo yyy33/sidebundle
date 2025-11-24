@@ -150,12 +150,48 @@ fn build_env_block(
         bundle_root.to_string_lossy().into_owned(),
     );
 
+    if let Some(java_home) = env_map.get("JAVA_HOME").cloned() {
+        if java_home.starts_with('/') {
+            let mut mapped = bundle_root.to_path_buf();
+            mapped.push("payload");
+            mapped.push(java_home.trim_start_matches('/'));
+            env_map.insert("JAVA_HOME".into(), mapped.to_string_lossy().into_owned());
+        }
+    }
+
+    let mut mapped_path_entries: Vec<String> = Vec::new();
+    if let Some(path) = env_map.get("PATH").cloned() {
+        mapped_path_entries = remap_path_entries(bundle_root, &path);
+        if !mapped_path_entries.is_empty() {
+            let mut combined = mapped_path_entries.join(":");
+            if !path.is_empty() {
+                combined.push(':');
+                combined.push_str(&path);
+            }
+            env_map.insert("PATH".into(), combined);
+        }
+    }
+
     if !library_paths.is_empty() {
-        let joined = library_paths
+        let mut entries: Vec<String> = library_paths
             .iter()
             .map(|path| bundle_root.join(path).to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(":");
+            .collect();
+        if let Some(java_home) = env_map.get("JAVA_HOME") {
+            let jh = Path::new(java_home);
+            entries.push(jh.join("lib").to_string_lossy().into_owned());
+            entries.push(jh.join("lib/server").to_string_lossy().into_owned());
+        }
+        // Heuristic: for each PATH bin entry, also add sibling lib directories to help JVM loads.
+        for bin in &mapped_path_entries {
+            let bin_path = Path::new(bin);
+            if let Some(parent) = bin_path.parent() {
+                entries.push(parent.join("lib").to_string_lossy().into_owned());
+                entries.push(parent.join("lib/server").to_string_lossy().into_owned());
+            }
+        }
+        dedup_strings(&mut entries);
+        let joined = entries.join(":");
         env_map.insert("LD_LIBRARY_PATH".into(), joined);
     }
 
@@ -167,6 +203,27 @@ fn build_env_block(
         block.push(CString::new(pair).map_err(|err| anyhow!("invalid env: {err}"))?);
     }
     Ok(block)
+}
+
+fn remap_path_entries(bundle_root: &Path, path: &str) -> Vec<String> {
+    path.split(':')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|p| {
+            let stripped = p.strip_prefix("/").unwrap_or(&p);
+            bundle_root
+                .join("payload")
+                .join(stripped)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+fn dedup_strings(values: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|v| seen.insert(v.clone()));
 }
 
 fn os_to_cstring(value: &OsStr) -> Result<CString> {

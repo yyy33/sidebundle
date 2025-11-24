@@ -14,6 +14,7 @@ use sidebundle_closure::{
     image::ImageConfig,
     trace::{AgentTraceCommand, TraceSpec, TraceSpecReport},
 };
+use crate::TraceBackendArg;
 use tempfile::TempDir;
 
 use crate::{BackendPreference, ImageEntryArg};
@@ -103,7 +104,12 @@ impl AgentTraceRunner {
         })
     }
 
-    pub(crate) fn run(&self, reference: &str, entries: &[ImageEntryArg]) -> Result<AgentRunResult> {
+    pub(crate) fn run(
+        &self,
+        reference: &str,
+        entries: &[ImageEntryArg],
+        trace_backend: TraceBackendArg,
+    ) -> Result<AgentRunResult> {
         let spec_dir = TempDir::new().context("failed to create agent spec dir")?;
         let out_dir = TempDir::new().context("failed to create agent output dir")?;
         let export_dir = TempDir::new().context("failed to create agent rootfs dir")?;
@@ -120,6 +126,8 @@ impl AgentTraceRunner {
             .arg(&container_name)
             .arg("--cap-add")
             .arg("SYS_PTRACE")
+            .arg("--cap-add")
+            .arg("SYS_ADMIN")
             .arg("--security-opt")
             .arg("seccomp=unconfined")
             .arg("--pids-limit")
@@ -144,7 +152,14 @@ impl AgentTraceRunner {
             .arg("--output")
             .arg("/sb-out")
             .arg("--trace-backend")
-            .arg("ptrace");
+            .arg(match trace_backend {
+                TraceBackendArg::Fanotify => "fanotify",
+                TraceBackendArg::Combined | TraceBackendArg::AgentCombined => "combined",
+                TraceBackendArg::Ptrace | TraceBackendArg::Auto | TraceBackendArg::Agent => {
+                    "ptrace"
+                }
+                TraceBackendArg::Off => "off",
+            });
         let create_out = create_cmd
             .output()
             .context("failed to create agent container")?;

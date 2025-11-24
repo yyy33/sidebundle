@@ -112,7 +112,10 @@ fn execute_create(args: CreateArgs) -> Result<()> {
     let host_backend =
         resolve_trace_backend(trace_backend).context("failed to configure host trace backend")?;
     let image_backend_choice = image_trace_backend.unwrap_or(trace_backend);
-    let agent_launch = if matches!(image_backend_choice, TraceBackendArg::Agent) {
+    let agent_launch = if matches!(
+        image_backend_choice,
+        TraceBackendArg::Agent | TraceBackendArg::AgentCombined
+    ) {
         Some(
             AgentLaunchConfig::from_args(
                 image_agent_bin,
@@ -419,6 +422,7 @@ enum TraceBackendArg {
     Fanotify,
     Combined,
     Agent,
+    AgentCombined,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -696,7 +700,14 @@ fn build_image_closure(
         };
         let mut errors = Vec::new();
         for backend in attempts {
-            match build_agent_image_closure(backend, reference, entries, target, launch) {
+            match build_agent_image_closure(
+                backend,
+                reference,
+                entries,
+                target,
+                launch,
+                trace_backend,
+            ) {
                 Ok(result) => return Ok(result),
                 Err(err) => errors.push(format!("{backend:?}: {err:?}")),
             }
@@ -785,6 +796,7 @@ fn build_agent_image_closure(
     entries: &[ImageEntryArg],
     target: TargetTriple,
     launch: &AgentLaunchConfig,
+    trace_backend: TraceBackendArg,
 ) -> Result<ImageClosureResult> {
     let backend_name = match backend {
         BackendPreference::Docker => "docker",
@@ -801,7 +813,7 @@ fn build_agent_image_closure(
         "agent: launching container backed by {:?} for `{}`",
         backend, reference
     );
-    let run_result = runner.run(reference, entries)?;
+    let run_result = runner.run(reference, entries, trace_backend)?;
     let AgentRunResult {
         report,
         rootfs,
@@ -911,24 +923,37 @@ fn build_closure_from_root(
         }
         builder = builder.with_tracer(tracer);
     }
+    // Merge PATH from image config env and runtime metadata (if present) for command resolution.
+    let mut merged_paths: Vec<PathBuf> = Vec::new();
     if let Some(path_value) = image_env
         .iter()
         .find(|(k, _)| k == "PATH")
         .map(|(_, v)| v.clone())
     {
-        let path_entries: Vec<PathBuf> =
-            ClosureBuilder::split_paths(&path_value.to_string_lossy());
-        builder = builder.with_origin_path(origin.clone(), path_entries);
+        merged_paths.extend(ClosureBuilder::split_paths(&path_value.to_string_lossy()));
+    }
+    if let Some(meta_path) = metadata
+        .as_ref()
+        .and_then(|m| m.env.get("PATH"))
+    {
+        merged_paths.extend(ClosureBuilder::split_paths(meta_path));
+    }
+    if !merged_paths.is_empty() {
+        // Dedup while preserving order.
+        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        merged_paths.retain(|p| seen.insert(p.clone()));
+        builder = builder.with_origin_path(origin.clone(), merged_paths);
     }
 
     let mut closure = builder
         .build(&spec)
         .with_context(|| format!("failed to build closure inside image `{reference}`"))?;
-    if let Some(snapshot) = metadata {
+    if let Some(ref snapshot) = metadata {
         if !snapshot.is_empty() {
-            closure.metadata.insert(origin.clone(), snapshot);
+            closure.metadata.insert(origin.clone(), snapshot.clone());
         }
     }
+    include_java_runtime(root.rootfs(), &origin, &mut closure, metadata.as_ref());
     Ok(ImageClosureResult {
         closure,
         resolver_entries: vec![(origin, chroot_resolver)],
@@ -1059,7 +1084,13 @@ fn configure_image_trace_backend(
             let _ = agent_launch.ok_or_else(|| {
                 anyhow::anyhow!("--image-agent-bin/cli must be provided when using agent backend")
             })?;
-            bail!("agent trace backend is handled separately for image inputs")
+            Ok(None)
+        }
+        TraceBackendArg::AgentCombined => {
+            let _ = agent_launch.ok_or_else(|| {
+                anyhow::anyhow!("--image-agent-bin/cli must be provided when using agent backend")
+            })?;
+            Ok(None)
         }
         other => resolve_trace_backend(other),
     }
@@ -1110,6 +1141,9 @@ fn resolve_trace_backend(arg: TraceBackendArg) -> Result<Option<TraceBackendKind
         }
         TraceBackendArg::Agent => {
             bail!("agent trace backend is only available for image inputs");
+        }
+        TraceBackendArg::AgentCombined => {
+            bail!("agent-combined trace backend is only available for image inputs");
         }
     }
 }
@@ -1187,6 +1221,63 @@ fn log_validation_report(report: &ValidationReport) {
                     "validation issue: {} ({})",
                     entry.display_name,
                     describe_status(&entry.status)
+                );
+            }
+        }
+    }
+}
+
+fn include_java_runtime(
+    rootfs: &Path,
+    origin: &Origin,
+    closure: &mut DependencyClosure,
+    metadata: Option<&RuntimeMetadata>,
+) {
+    let Some(meta) = metadata else {
+        return;
+    };
+    let Some(java_home) = meta.env.get("JAVA_HOME") else {
+        return;
+    };
+    let java_home_path = Path::new(java_home);
+    if !java_home_path.is_absolute() {
+        return;
+    }
+    let base = rootfs.join(java_home_path.strip_prefix("/").unwrap_or(java_home_path));
+    let candidates = [
+        base.join("lib/libjava.so"),
+        base.join("lib/server/libjvm.so"),
+    ];
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        let destination = payload_path_for(&candidate);
+        if closure
+            .files
+            .iter()
+            .any(|f| f.destination == destination)
+        {
+            continue;
+        }
+        match compute_digest(&candidate) {
+            Ok(digest) => {
+                closure.files.push(ResolvedFile {
+                    source: candidate.clone(),
+                    destination,
+                    digest,
+                });
+                debug!(
+                    "java runtime: added {} from JAVA_HOME {} for origin {:?}",
+                    candidate.display(),
+                    java_home,
+                    origin
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "java runtime: failed to hash {}: {err}",
+                    candidate.display()
                 );
             }
         }

@@ -5,6 +5,7 @@ pub mod validator;
 
 use crate::image::ImageRoot;
 use log::warn;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -204,6 +205,7 @@ pub struct ClosureBuilder {
     ld_library_paths: Vec<PathBuf>,
     default_paths: Vec<PathBuf>,
     origin_paths: HashMap<Origin, Vec<PathBuf>>,
+    scanned_scripts: RefCell<HashSet<PathBuf>>,
     runner: LinkerRunner,
     tracer: Option<trace::TraceCollector>,
     resolvers: ResolverSet,
@@ -222,6 +224,7 @@ impl ClosureBuilder {
                 .map(|dir| PathBuf::from(dir))
                 .collect(),
             origin_paths: HashMap::new(),
+            scanned_scripts: RefCell::new(HashSet::new()),
             runner: LinkerRunner::new(),
             tracer: None,
             resolvers: ResolverSet::new(),
@@ -858,6 +861,10 @@ impl ClosureBuilder {
             .get(origin)
             .cloned()
             .unwrap_or_else(|| self.shebang_path_entries());
+        debug!(
+            "resolving command `{}` in origin {:?} with PATH {:?}",
+            command, origin, search_paths
+        );
         for dir in search_paths {
             let joined = dir.join(command);
             if let Some(resolved) = self.resolve_in_origin(resolver, origin, &joined) {
@@ -1009,21 +1016,44 @@ impl ClosureBuilder {
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) {
         let commands = Self::scan_bash_commands(script);
+        {
+            let mut seen = self.scanned_scripts.borrow_mut();
+            if !seen.insert(script.to_path_buf()) {
+                debug!(
+                    "bash static scan: skipping already scanned script {}",
+                    script.display()
+                );
+                return;
+            }
+        }
         let mut visited: HashSet<PathBuf> = HashSet::new();
         for cmd in commands {
-            if let Some(resolved) = self.resolve_command(resolver, origin, &cmd) {
-                if !visited.insert(resolved.clone()) {
-                    continue;
+            match self.resolve_command(resolver, origin, &cmd) {
+                Some(resolved) => {
+                    if !visited.insert(resolved.clone()) {
+                        continue;
+                    }
+                    debug!(
+                        "bash static scan: resolved command `{}` -> {}",
+                        cmd,
+                        resolved.display()
+                    );
+                    let _ = self.build_entry_plan(
+                        resolver,
+                        origin,
+                        &resolved,
+                        &cmd,
+                        files,
+                        aliases,
+                        cache,
+                    );
                 }
-                let _ = self.build_binary_plan(
-                    resolver,
-                    origin,
-                    &resolved,
-                    &cmd,
-                    files,
-                    aliases,
-                    cache,
-                );
+                None => {
+                    debug!(
+                        "bash static scan: command `{}` not found via PATH for origin {:?}",
+                        cmd, origin
+                    );
+                }
             }
         }
     }
