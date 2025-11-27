@@ -14,6 +14,14 @@ sidebundle 用于从动态链接的 ELF 可执行文件构建可迁移的离线�
 scip-index应用打包前后占用空间对比
 ![对比](./statics/compares.png)
 
+1.基础演示：不再被‘glibc_x not found’和'libx.so: cannot open shared object'困扰
+
+https://github.com/user-attachments/assets/0b0b1e63-c268-4217-afb0-489168ec6ece
+
+2.镜像用法：从docker（或者是podman）镜像中提取shebang script(javascript)和背后的elf依赖（node）到另一个完全不同的linux环境下完美运行
+
+https://github.com/user-attachments/assets/0d4f2ec8-2864-4a33-ab3f-e51773a10af2
+
 ## 特性
 - 打包来自宿主机或 OCI 镜像的可执行文件。
 - 通过静态分析与运行时跟踪（ptrace/fanotify）解析依赖。
