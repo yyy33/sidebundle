@@ -295,10 +295,9 @@ impl From<LinkerError> for LinkerFailure {
                 LinkerFailure::LibraryNotFound { name, raw }
             }
             LinkerError::InvalidPath(path) => LinkerFailure::InvalidPath { path },
-            LinkerError::UnsupportedStub { linker, message } => LinkerFailure::UnsupportedStub {
-                linker,
-                message,
-            },
+            LinkerError::UnsupportedStub { linker, message } => {
+                LinkerFailure::UnsupportedStub { linker, message }
+            }
         }
     }
 }
@@ -306,7 +305,7 @@ impl From<LinkerError> for LinkerFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sidebundle_core::{BinaryEntryPlan, EntryBundlePlan, Origin};
+    use sidebundle_core::{BinaryEntryPlan, EntryBundlePlan, Origin, RunMode};
     use std::fs;
     use tempfile::tempdir;
 
@@ -320,6 +319,7 @@ mod tests {
             library_dirs: vec![PathBuf::from("payload/lib64")],
             requires_linker: require_linker,
             origin: Origin::Host,
+            run_mode: Some(RunMode::Host),
         })
     }
 
@@ -340,12 +340,10 @@ mod tests {
         let validator = BundleValidator::new();
         let tmp = tempdir().unwrap();
         let plan = dummy_plan(false);
-        let binary_path = tmp.path().join(
-            match &plan {
-                EntryBundlePlan::Binary(inner) => &inner.binary_destination,
-                _ => unreachable!(),
-            },
-        );
+        let binary_path = tmp.path().join(match &plan {
+            EntryBundlePlan::Binary(inner) => &inner.binary_destination,
+            _ => unreachable!(),
+        });
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"#!/bin/true\n").unwrap();
         let report = validator.validate_with_report(tmp.path(), &[plan]);

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use linker::{is_gcompat_stub_binary, LibraryResolution, LinkerError, LinkerRunner};
 use log::debug;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use shell_words;
 use sidebundle_core::{
@@ -22,7 +23,6 @@ use sidebundle_core::{
     ElfParseError, EntryBundlePlan, LogicalPath, Origin, ResolvedFile, ScriptEntryPlan, TracedFile,
 };
 use thiserror::Error;
-use regex::Regex;
 const DEFAULT_LIBRARY_DIRS: &[&str] = &[
     "/lib",
     "/lib64",
@@ -166,11 +166,68 @@ impl PathResolver for ChrootPathResolver {
     }
 
     fn host_to_logical(&self, host_path: &Path) -> Option<LogicalPath> {
-        let rel = host_path.strip_prefix(&self.root).ok()?;
-        let mut rebuilt = PathBuf::from("/");
-        rebuilt.push(rel);
-        Some(LogicalPath::new(self.origin.clone(), rebuilt))
+        if let Ok(rel) = host_path.strip_prefix(&self.root) {
+            if let Some(logical) = rebuild_logical(rel.to_path_buf(), &self.origin) {
+                return Some(logical);
+            }
+        }
+        // fallback: try pathdiff to strip root even if components differ (e.g., canonicalized tmp prefixes)
+        if let Some(rel) = pathdiff::diff_paths(host_path, &self.root) {
+            if let Some(logical) = rebuild_logical(rel, &self.origin) {
+                return Some(logical);
+            }
+        }
+        // special-case temp export prefixes (/tmp/.tmpXXXX/...), strip until after the temp dir.
+        if let Some(stripped) = strip_tmp_prefix(host_path) {
+            if let Some(logical) = rebuild_logical(stripped, &self.origin) {
+                return Some(logical);
+            }
+        }
+        None
     }
+}
+
+fn rebuild_logical(rel: PathBuf, origin: &Origin) -> Option<LogicalPath> {
+    let mut comps = rel.components().peekable();
+    if let Some(first) = comps.peek() {
+        if first.as_os_str() == "rootfs" {
+            comps.next();
+        }
+    }
+    let mut rebuilt = PathBuf::from("/");
+    for comp in comps {
+        rebuilt.push(comp.as_os_str());
+    }
+    if rebuilt == Path::new("/") {
+        return None;
+    }
+    Some(LogicalPath::new(origin.clone(), rebuilt))
+}
+
+fn strip_tmp_prefix(path: &Path) -> Option<PathBuf> {
+    let mut comps = path.components();
+    let first = comps.next()?; // RootDir
+    let second = comps.next()?;
+    if first.as_os_str() != "/" || second.as_os_str() != "tmp" {
+        return None;
+    }
+    let third = comps.next()?;
+    let third_str = third.as_os_str().to_string_lossy();
+    if !third_str.starts_with(".tmp") {
+        return None;
+    }
+    // Skip optional "rootfs" layer after temp dir.
+    let mut comps_iter = comps.peekable();
+    if let Some(peek) = comps_iter.peek() {
+        if peek.as_os_str() == "rootfs" {
+            comps_iter.next();
+        }
+    }
+    let mut rebuilt = PathBuf::from("/");
+    for c in comps_iter {
+        rebuilt.push(c.as_os_str());
+    }
+    Some(rebuilt)
 }
 
 #[derive(Clone)]
@@ -282,13 +339,17 @@ impl ClosureBuilder {
 
         for entry in spec.entries() {
             let resolver = self.resolver_for(entry.logical.origin())?;
-            let plan = self.build_entry(
+            let mut plan = self.build_entry(
                 entry,
                 resolver.as_ref(),
                 &mut file_map,
                 &mut runtime_aliases,
                 &mut elf_cache,
             )?;
+            match &mut plan {
+                EntryBundlePlan::Binary(p) => p.run_mode = Some(spec.run_mode()),
+                EntryBundlePlan::Script(p) => p.run_mode = Some(spec.run_mode()),
+            }
             if let Some(tracer) = &self.tracer {
                 if let Some(command) = self.trace_command_for(entry, &plan, resolver.as_ref()) {
                     match tracer.run(resolver.as_ref(), &command) {
@@ -422,12 +483,12 @@ impl ClosureBuilder {
         if !trace_path_allowed(resolved) {
             return None;
         }
-            if let Some(reason) = self.filter_reason(resolved) {
-                debug!(
-                    "skipping traced artifact {} (filtered: {reason})",
-                    resolved.display()
-                );
-                return None;
+        if let Some(reason) = self.filter_reason(resolved) {
+            debug!(
+                "skipping traced artifact {} (filtered: {reason})",
+                resolved.display()
+            );
+            return None;
         }
         let host_path = resolved.clone();
         let is_elf = parse_elf_metadata(&host_path).is_ok();
@@ -575,6 +636,7 @@ impl ClosureBuilder {
                     library_dirs: interpreter_plan.library_dirs.clone(),
                     requires_linker: interpreter_plan.requires_linker,
                     origin: origin.clone(),
+                    run_mode: None,
                 };
                 if Self::is_bash_interpreter(&plan.interpreter_source) {
                     self.collect_bash_dependencies(
@@ -712,7 +774,10 @@ impl ClosureBuilder {
                         debug!(
                             "gcompat replacement: interpreter_source={}, interpreter_dest={}",
                             host_ld.display(),
-                            interpreter_dest.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())
+                            interpreter_dest
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "<none>".into())
                         );
                         requires_linker = true;
                     } else {
@@ -739,6 +804,7 @@ impl ClosureBuilder {
             library_dirs: libraries,
             requires_linker,
             origin: origin.clone(),
+            run_mode: None,
         })
     }
 
@@ -967,7 +1033,6 @@ impl ClosureBuilder {
         paths
     }
 
-
     fn resolve_additional_paths(
         resolver: &dyn PathResolver,
         origin: &Origin,
@@ -1052,15 +1117,8 @@ impl ClosureBuilder {
                         cmd,
                         resolved.display()
                     );
-                    let _ = self.build_entry_plan(
-                        resolver,
-                        origin,
-                        &resolved,
-                        &cmd,
-                        files,
-                        aliases,
-                        cache,
-                    );
+                    let _ = self
+                        .build_entry_plan(resolver, origin, &resolved, &cmd, files, aliases, cache);
                 }
                 None => {
                     debug!(
@@ -1143,7 +1201,10 @@ impl ClosureBuilder {
         if metadata.needed.is_empty() {
             return Ok(Vec::new());
         }
-        match self.runner.trace_dependencies(linker, subject, search_paths) {
+        match self
+            .runner
+            .trace_dependencies(linker, subject, search_paths)
+        {
             Ok(resolved) => Ok(resolved),
             Err(linker_err) => {
                 if matches!(linker_err, linker::LinkerError::UnsupportedStub { .. }) {

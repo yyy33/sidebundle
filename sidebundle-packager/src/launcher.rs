@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use sidebundle_core::{EntryBundlePlan, Origin, RuntimeMetadata};
+use sidebundle_core::{EntryBundlePlan, Origin, RunMode, RuntimeMetadata};
 
 use crate::PackagerError;
 
@@ -52,6 +52,7 @@ enum LauncherConfig {
         linker: Option<PathBuf>,
         library_paths: Vec<PathBuf>,
         metadata: Option<RuntimeMetadata>,
+        run_mode: RunMode,
     },
     Script {
         dynamic: bool,
@@ -61,6 +62,7 @@ enum LauncherConfig {
         linker: Option<PathBuf>,
         library_paths: Vec<PathBuf>,
         metadata: Option<RuntimeMetadata>,
+        run_mode: RunMode,
     },
 }
 
@@ -81,6 +83,7 @@ fn write_config(
             },
             library_paths: plan.library_dirs.clone(),
             metadata,
+            run_mode: plan.run_mode.unwrap_or(RunMode::Host),
         },
         EntryBundlePlan::Script(plan) => LauncherConfig::Script {
             dynamic: plan.requires_linker,
@@ -94,6 +97,7 @@ fn write_config(
             },
             library_paths: plan.library_dirs.clone(),
             metadata: inject_script_metadata(plan, metadata),
+            run_mode: plan.run_mode.unwrap_or(RunMode::Host),
         },
     };
     let data = serde_json::to_vec_pretty(&config).map_err(PackagerError::Manifest)?;
@@ -160,10 +164,7 @@ fn inject_script_metadata(
         return metadata;
     }
     let mut metadata = metadata.unwrap_or_default();
-    let opts = metadata
-        .env
-        .entry("NODE_OPTIONS".into())
-        .or_default();
+    let opts = metadata.env.entry("NODE_OPTIONS".into()).or_default();
     const FLAGS: &[&str] = &["--preserve-symlinks-main", "--preserve-symlinks"];
     for flag in FLAGS {
         if !opts.split_whitespace().any(|existing| existing == *flag) {

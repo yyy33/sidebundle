@@ -21,6 +21,21 @@ pub enum TargetOs {
     Linux,
 }
 
+/// 运行模式，决定 launcher 如何进入打包环境。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    Host,
+    Bwrap,
+    Chroot,
+}
+
+impl Default for RunMode {
+    fn default() -> Self {
+        RunMode::Host
+    }
+}
+
 /// 目标三元组，用于后续扩展到多平台。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetTriple {
@@ -179,6 +194,7 @@ pub struct BundleSpec {
     pub name: String,
     pub target: TargetTriple,
     pub entries: Vec<BundleEntry>,
+    pub run_mode: RunMode,
 }
 
 impl BundleSpec {
@@ -187,6 +203,7 @@ impl BundleSpec {
             name: name.into(),
             target,
             entries: Vec::new(),
+            run_mode: RunMode::default(),
         }
     }
 
@@ -197,6 +214,15 @@ impl BundleSpec {
 
     pub fn push_entry(&mut self, entry: BundleEntry) {
         self.entries.push(entry);
+    }
+
+    pub fn with_run_mode(mut self, run_mode: RunMode) -> Self {
+        self.run_mode = run_mode;
+        self
+    }
+
+    pub fn set_run_mode(&mut self, run_mode: RunMode) {
+        self.run_mode = run_mode;
     }
 
     pub fn host_entry(path: impl Into<PathBuf>, display_name: impl Into<String>) -> BundleEntry {
@@ -213,6 +239,10 @@ impl BundleSpec {
 
     pub fn target(&self) -> TargetTriple {
         self.target
+    }
+
+    pub fn run_mode(&self) -> RunMode {
+        self.run_mode
     }
 }
 
@@ -255,6 +285,7 @@ pub struct BinaryEntryPlan {
     pub library_dirs: Vec<PathBuf>,
     pub requires_linker: bool,
     pub origin: Origin,
+    pub run_mode: Option<RunMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +301,7 @@ pub struct ScriptEntryPlan {
     pub library_dirs: Vec<PathBuf>,
     pub requires_linker: bool,
     pub origin: Origin,
+    pub run_mode: Option<RunMode>,
 }
 
 impl EntryBundlePlan {

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use sidebundle_core::RuntimeMetadata;
+use sidebundle_core::{RuntimeMetadata, RunMode};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsStr};
@@ -41,20 +41,59 @@ fn run() -> Result<()> {
             linker,
             library_paths,
             metadata,
+            run_mode,
         } => {
-            let entry_path = bundle_root.join(&binary);
-            let argv = build_binary_argv(&entry_path)?;
-            let env_block = build_env_block(bundle_root, &library_paths, metadata.as_ref())?;
-            if !dynamic {
-                exec_static(&entry_path, &argv, &env_block)?;
-                unreachable!();
-            }
-            let linker = linker
+            let run_mode = run_mode;
+            let payload_root = bundle_root.join("payload");
+            let entry_host = bundle_root.join(&binary);
+            let entry_mapped = map_bundle_path(bundle_root, &binary, run_mode);
+            let linker_mapped = linker
                 .as_ref()
-                .map(|rel| bundle_root.join(rel))
-                .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
-            exec_dynamic(&linker, &entry_path, &argv, &env_block)?;
-            unreachable!();
+                .map(|rel| map_bundle_path(bundle_root, rel, run_mode));
+            let argv = build_binary_argv(&entry_mapped)?;
+            let env_block =
+                build_env_block(bundle_root, run_mode, &library_paths, metadata.as_ref())?;
+            match run_mode {
+                RunMode::Host => {
+                    if !dynamic {
+                        exec_static(&entry_host, &argv, &env_block)?;
+                        unreachable!();
+                    }
+                    let linker_host = linker
+                        .as_ref()
+                        .map(|rel| bundle_root.join(rel))
+                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+                    exec_dynamic(&linker_host, &entry_host, &argv, &env_block)?;
+                    unreachable!();
+                }
+                RunMode::Bwrap => {
+                    let linker_inside = linker_mapped
+                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+                    exec_bwrap(
+                        bundle_root,
+                        &payload_root,
+                        dynamic,
+                        &linker_inside,
+                        &entry_mapped,
+                        &argv,
+                        &env_block,
+                    )?;
+                    unreachable!();
+                }
+                RunMode::Chroot => {
+                    let linker_inside = linker_mapped
+                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+                    exec_chroot(
+                        &payload_root,
+                        dynamic,
+                        &linker_inside,
+                        &entry_mapped,
+                        &argv,
+                        &env_block,
+                    )?;
+                    unreachable!();
+                }
+            }
         }
         LauncherConfig::Script {
             dynamic,
@@ -64,21 +103,60 @@ fn run() -> Result<()> {
             linker,
             library_paths,
             metadata,
+            run_mode,
         } => {
-            let interpreter_path = bundle_root.join(&interpreter);
-            let script_path = bundle_root.join(&script);
-            let argv = build_script_argv(&interpreter_path, &script_path, &args)?;
-            let env_block = build_env_block(bundle_root, &library_paths, metadata.as_ref())?;
-            if !dynamic {
-                exec_static(&interpreter_path, &argv, &env_block)?;
-                unreachable!();
-            }
-            let linker = linker
+            let run_mode = run_mode;
+            let payload_root = bundle_root.join("payload");
+            let interpreter_host = bundle_root.join(&interpreter);
+            let interpreter_mapped = map_bundle_path(bundle_root, &interpreter, run_mode);
+            let script_mapped = map_bundle_path(bundle_root, &script, run_mode);
+            let linker_mapped = linker
                 .as_ref()
-                .map(|rel| bundle_root.join(rel))
-                .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
-            exec_dynamic(&linker, &interpreter_path, &argv, &env_block)?;
-            unreachable!();
+                .map(|rel| map_bundle_path(bundle_root, rel, run_mode));
+            let argv = build_script_argv(&interpreter_mapped, &script_mapped, &args)?;
+            let env_block =
+                build_env_block(bundle_root, run_mode, &library_paths, metadata.as_ref())?;
+            match run_mode {
+                RunMode::Host => {
+                    if !dynamic {
+                        exec_static(&interpreter_host, &argv, &env_block)?;
+                        unreachable!();
+                    }
+                    let linker_host = linker
+                        .as_ref()
+                        .map(|rel| bundle_root.join(rel))
+                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+                    exec_dynamic(&linker_host, &interpreter_host, &argv, &env_block)?;
+                    unreachable!();
+                }
+                RunMode::Bwrap => {
+                    let linker_inside = linker_mapped
+                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+                    exec_bwrap(
+                        bundle_root,
+                        &payload_root,
+                        dynamic,
+                        &linker_inside,
+                        &interpreter_mapped,
+                        &argv,
+                        &env_block,
+                    )?;
+                    unreachable!();
+                }
+                RunMode::Chroot => {
+                    let linker_inside = linker_mapped
+                        .ok_or_else(|| anyhow!("dynamic launcher missing linker path"))?;
+                    exec_chroot(
+                        &payload_root,
+                        dynamic,
+                        &linker_inside,
+                        &interpreter_mapped,
+                        &argv,
+                        &env_block,
+                    )?;
+                    unreachable!();
+                }
+            }
         }
     }
 }
@@ -92,6 +170,8 @@ enum LauncherConfig {
         linker: Option<PathBuf>,
         library_paths: Vec<PathBuf>,
         metadata: Option<RuntimeMetadata>,
+        #[serde(default = "default_run_mode")]
+        run_mode: RunMode,
     },
     Script {
         dynamic: bool,
@@ -101,7 +181,13 @@ enum LauncherConfig {
         linker: Option<PathBuf>,
         library_paths: Vec<PathBuf>,
         metadata: Option<RuntimeMetadata>,
+        #[serde(default = "default_run_mode")]
+        run_mode: RunMode,
     },
+}
+
+fn default_run_mode() -> RunMode {
+    RunMode::Host
 }
 
 fn load_config(bundle_root: &Path, entry_name: &str) -> Result<LauncherConfig> {
@@ -138,6 +224,7 @@ fn build_script_argv(interpreter: &Path, script: &Path, args: &[String]) -> Resu
 
 fn build_env_block(
     bundle_root: &Path,
+    run_mode: RunMode,
     library_paths: &[PathBuf],
     metadata: Option<&RuntimeMetadata>,
 ) -> Result<Vec<CString>> {
@@ -160,25 +247,37 @@ fn build_env_block(
     }
 
     let mut mapped_path_entries: Vec<String> = Vec::new();
-    if let Some(path) = env_map.get("PATH").cloned() {
-        mapped_path_entries = remap_path_entries(bundle_root, &path);
-        if !mapped_path_entries.is_empty() {
-            let mut combined = mapped_path_entries.join(":");
-            if !path.is_empty() {
-                combined.push(':');
-                combined.push_str(&path);
+    if run_mode == RunMode::Host {
+        if let Some(path) = env_map.get("PATH").cloned() {
+            mapped_path_entries = remap_path_entries(bundle_root, run_mode, &path);
+            if !mapped_path_entries.is_empty() {
+                let mut combined = mapped_path_entries.join(":");
+                if !path.is_empty() {
+                    combined.push(':');
+                    combined.push_str(&path);
+                }
+                env_map.insert("PATH".into(), combined);
             }
-            env_map.insert("PATH".into(), combined);
         }
+    } else {
+        // bwrap/chroot：确保 PATH 至少包含常见宿主目录，避免找不到 bwrap。
+        let default_path = env_map
+            .get("PATH")
+            .cloned()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+        env_map.insert("PATH".into(), default_path.clone());
+        mapped_path_entries = default_path.split(':').filter(|p| !p.is_empty()).map(|s| s.to_string()).collect();
     }
 
     if !library_paths.is_empty() {
         let mut entries: Vec<String> = library_paths
             .iter()
-            .map(|path| bundle_root.join(path).to_string_lossy().into_owned())
+            .map(|path| map_bundle_path(bundle_root, path, run_mode))
+            .map(|p| p.to_string_lossy().into_owned())
             .collect();
         if let Some(java_home) = env_map.get("JAVA_HOME") {
-            let jh = Path::new(java_home);
+            let jh = map_env_path(java_home, run_mode);
             entries.push(jh.join("lib").to_string_lossy().into_owned());
             entries.push(jh.join("lib/server").to_string_lossy().into_owned());
         }
@@ -205,16 +304,13 @@ fn build_env_block(
     Ok(block)
 }
 
-fn remap_path_entries(bundle_root: &Path, path: &str) -> Vec<String> {
+fn remap_path_entries(bundle_root: &Path, mode: RunMode, path: &str) -> Vec<String> {
     path.split(':')
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .map(|p| {
-            let stripped = p.strip_prefix("/").unwrap_or(&p);
-            bundle_root
-                .join("payload")
-                .join(stripped)
+            map_bundle_path(bundle_root, &p, mode)
                 .to_string_lossy()
                 .into_owned()
         })
@@ -224,6 +320,65 @@ fn remap_path_entries(bundle_root: &Path, path: &str) -> Vec<String> {
 fn dedup_strings(values: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     values.retain(|v| seen.insert(v.clone()));
+}
+
+fn map_bundle_path(bundle_root: &Path, rel: &Path, mode: RunMode) -> PathBuf {
+    match mode {
+        RunMode::Host => bundle_root.join(rel),
+        RunMode::Bwrap | RunMode::Chroot => {
+            if rel.is_absolute() {
+                return rel.to_path_buf();
+            }
+            let mut comps = rel.components();
+            if let Some(first) = comps.next() {
+                if first.as_os_str() == "payload" {
+                    let mut rebuilt = PathBuf::from("/");
+                    for c in comps {
+                        rebuilt.push(c.as_os_str());
+                    }
+                    return rebuilt;
+                }
+            }
+            let mut rebuilt = PathBuf::from("/");
+            rebuilt.push(rel);
+            rebuilt
+        }
+    }
+}
+
+fn map_env_path(value: &str, mode: RunMode) -> PathBuf {
+    let p = Path::new(value);
+    if !p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match mode {
+        RunMode::Host => p.to_path_buf(),
+        RunMode::Bwrap | RunMode::Chroot => Path::new("/").join(p.strip_prefix("/").unwrap_or(p)),
+    }
+}
+
+fn find_bwrap() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SIDEBUNDLE_BWRAP") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':').filter(|p| !p.is_empty()) {
+            let candidate = PathBuf::from(dir).join("bwrap");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    for candidate in ["/usr/bin/bwrap", "/usr/local/bin/bwrap", "/bin/bwrap"] {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn os_to_cstring(value: &OsStr) -> Result<CString> {
@@ -275,4 +430,109 @@ fn exec_dynamic(linker: &Path, entry: &Path, argv: &[CString], envp: &[CString])
             entry.display()
         )
     })
+}
+
+fn exec_bwrap(
+    bundle_root: &Path,
+    payload_root: &Path,
+    dynamic: bool,
+    linker: &Path,
+    entry: &Path,
+    argv: &[CString],
+    envp: &[CString],
+) -> Result<()> {
+    let bwrap_bin = find_bwrap().context("bubblewrap (bwrap) not found in PATH; required for run_mode=bwrap")?;
+
+    let mut args: Vec<CString> = Vec::new();
+    args.push(os_to_cstring(bwrap_bin.as_os_str())?);
+    args.push(CString::new("--bind")?);
+    args.push(CString::new(payload_root.to_string_lossy().to_string())?);
+    args.push(CString::new("/")?);
+    let data_root = bundle_root.join("data");
+    if data_root.exists() {
+        // ensure target mountpoint exists under new root (/data)
+        let _ = std::fs::create_dir_all(payload_root.join("data"));
+        args.push(CString::new("--bind")?);
+        args.push(CString::new(data_root.to_string_lossy().to_string())?);
+        args.push(CString::new("/data")?);
+    }
+    args.push(CString::new("--proc")?);
+    args.push(CString::new("/proc")?);
+    // minimal device/tempo mounts
+    args.push(CString::new("--dev-bind")?);
+    args.push(CString::new("/dev/null")?);
+    args.push(CString::new("/dev/null")?);
+    args.push(CString::new("--dev-bind")?);
+    args.push(CString::new("/dev/zero")?);
+    args.push(CString::new("/dev/zero")?);
+    args.push(CString::new("--dev-bind")?);
+    args.push(CString::new("/dev/tty")?);
+    args.push(CString::new("/dev/tty")?);
+    args.push(CString::new("--dev-bind")?);
+    args.push(CString::new("/dev/urandom")?);
+    args.push(CString::new("/dev/urandom")?);
+    args.push(CString::new("--tmpfs")?);
+    args.push(CString::new("/tmp")?);
+    args.push(CString::new("--tmpfs")?);
+    args.push(CString::new("/run")?);
+    args.push(CString::new("--tmpfs")?);
+    args.push(CString::new("/dev/shm")?);
+    // DNS/hosts
+    for file in ["/etc/resolv.conf", "/etc/hosts"] {
+        args.push(CString::new("--ro-bind")?);
+        args.push(CString::new(file)?);
+        args.push(CString::new(file)?);
+    }
+    args.push(CString::new("--die-with-parent")?);
+    args.push(CString::new("--unshare-all")?);
+    args.push(CString::new("--")?);
+
+    if dynamic {
+        args.push(os_to_cstring(linker.as_os_str())?);
+        args.push(os_to_cstring(entry.as_os_str())?);
+        for arg in argv.iter().skip(1) {
+            args.push(arg.clone());
+        }
+    } else {
+        args.push(os_to_cstring(entry.as_os_str())?);
+        for arg in argv.iter().skip(1) {
+            args.push(arg.clone());
+        }
+    }
+
+    let mut argv_ptrs: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut env_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+    env_ptrs.push(std::ptr::null());
+
+    unsafe {
+        libc::execve(args[0].as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
+    }
+    Err(std::io::Error::last_os_error()).with_context(|| "execve failed for bubblewrap launcher")
+}
+
+fn exec_chroot(
+    payload_root: &Path,
+    dynamic: bool,
+    linker: &Path,
+    entry: &Path,
+    argv: &[CString],
+    envp: &[CString],
+) -> Result<()> {
+    unsafe {
+        let root_c = os_to_cstring(payload_root.as_os_str())?;
+        if libc::chroot(root_c.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| "chroot failed for launcher");
+        }
+        if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| "chdir after chroot failed");
+        }
+    }
+    if dynamic {
+        exec_dynamic(linker, entry, argv, envp)
+    } else {
+        exec_static(entry, argv, envp)
+    }
 }

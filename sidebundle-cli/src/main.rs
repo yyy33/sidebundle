@@ -26,7 +26,7 @@ use sidebundle_closure::{
 };
 use sidebundle_core::{
     AuxvEntry, BundleEntry, BundleSpec, DependencyClosure, LogicalPath, MergeReport, Origin,
-    ResolvedFile, RuntimeMetadata, SystemInfo, TargetTriple,
+    ResolvedFile, RunMode, RuntimeMetadata, SystemInfo, TargetTriple,
 };
 use sidebundle_packager::Packager;
 
@@ -76,6 +76,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         image_agent_keep_rootfs,
         allow_gpu_libs,
         strict_validate,
+        run_mode,
     } = args;
 
     if from_host.is_empty() && from_image.is_empty() {
@@ -93,7 +94,9 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         from_image.len()
     );
 
+    let run_mode_resolved = resolve_run_mode(run_mode);
     let mut spec = BundleSpec::new(name, target);
+    spec.set_run_mode(run_mode_resolved);
     for (idx, entry) in from_host.iter().enumerate() {
         std::fs::metadata(&entry.path)
             .with_context(|| format!("failed to read host executable: {}", entry.path.display()))?;
@@ -170,6 +173,7 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             image_backend_choice,
             agent_launch.as_ref(),
             allow_gpu_libs,
+            run_mode_resolved,
         )
         .with_context(|| {
             format!("failed to build closure for image `{reference}` using backend {preference:?}")
@@ -374,6 +378,10 @@ struct CreateArgs {
     #[arg(long = "allow-gpu-libs")]
     allow_gpu_libs: bool,
 
+    /// Runtime execution mode for launchers
+    #[arg(long = "run-mode", value_enum, default_value_t = RunModeArg::Host)]
+    run_mode: RunModeArg,
+
     /// Runtime trace backend for host inputs
     #[arg(long = "trace-backend", value_enum, default_value_t = TraceBackendArg::Auto)]
     trace_backend: TraceBackendArg,
@@ -438,6 +446,13 @@ enum ImageBackendArg {
     Auto,
     Docker,
     Podman,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum RunModeArg {
+    Host,
+    Bwrap,
+    Chroot,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -696,11 +711,15 @@ fn build_image_closure(
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
     allow_gpu_libs: bool,
+    run_mode: RunMode,
 ) -> Result<ImageClosureResult> {
     if entries.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
     }
-    if matches!(trace_backend, TraceBackendArg::Agent | TraceBackendArg::AgentCombined) {
+    if matches!(
+        trace_backend,
+        TraceBackendArg::Agent | TraceBackendArg::AgentCombined
+    ) {
         let launch = agent_launch
             .ok_or_else(|| anyhow::anyhow!("agent backend requires --image-agent-* options"))?;
         let attempts: Vec<BackendPreference> = match preference {
@@ -717,6 +736,7 @@ fn build_image_closure(
                 launch,
                 trace_backend,
                 allow_gpu_libs,
+                run_mode,
             ) {
                 Ok(result) => return Ok(result),
                 Err(err) => errors.push(format!("{backend:?}: {err:?}")),
@@ -742,6 +762,7 @@ fn build_image_closure(
             trace_backend,
             agent_launch,
             allow_gpu_libs,
+            run_mode,
         ) {
             Ok(result) => return Ok(result),
             Err(err) => errors.push(format!("{backend:?}: {err:?}")),
@@ -761,6 +782,7 @@ fn build_with_backend(
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
     allow_gpu_libs: bool,
+    run_mode: RunMode,
 ) -> Result<ImageClosureResult> {
     match backend {
         BackendPreference::Docker => {
@@ -778,6 +800,7 @@ fn build_with_backend(
                 trace_backend,
                 agent_launch,
                 allow_gpu_libs,
+                run_mode,
                 None,
                 None,
             )
@@ -797,6 +820,7 @@ fn build_with_backend(
                 trace_backend,
                 agent_launch,
                 allow_gpu_libs,
+                run_mode,
                 None,
                 None,
             )
@@ -812,6 +836,7 @@ fn build_agent_image_closure(
     launch: &AgentLaunchConfig,
     trace_backend: TraceBackendArg,
     allow_gpu_libs: bool,
+    run_mode: RunMode,
 ) -> Result<ImageClosureResult> {
     let backend_name = match backend {
         BackendPreference::Docker => "docker",
@@ -877,6 +902,7 @@ fn build_agent_image_closure(
         TraceBackendArg::Off,
         None,
         allow_gpu_libs,
+        run_mode,
         Some(trace_files),
         metadata,
     )
@@ -892,6 +918,7 @@ fn build_closure_from_root(
     trace_backend: TraceBackendArg,
     agent_launch: Option<&AgentLaunchConfig>,
     allow_gpu_libs: bool,
+    run_mode: RunMode,
     external_traces: Option<Vec<PathBuf>>,
     metadata: Option<RuntimeMetadata>,
 ) -> Result<ImageClosureResult> {
@@ -899,6 +926,7 @@ fn build_closure_from_root(
     ensure_image_library_aliases(&rootfs);
     let image_env = parse_image_env(&root.config().env);
     let mut spec = BundleSpec::new(format!("{backend_name}:{reference}"), target);
+    spec.set_run_mode(run_mode);
     let origin = Origin::Image(reference.to_string());
     for (idx, entry_spec) in entries.iter().enumerate() {
         let physical = physical_image_path(&rootfs, &entry_spec.path);
@@ -951,10 +979,7 @@ fn build_closure_from_root(
     {
         merged_paths.extend(ClosureBuilder::split_paths(&path_value.to_string_lossy()));
     }
-    if let Some(meta_path) = metadata
-        .as_ref()
-        .and_then(|m| m.env.get("PATH"))
-    {
+    if let Some(meta_path) = metadata.as_ref().and_then(|m| m.env.get("PATH")) {
         merged_paths.extend(ClosureBuilder::split_paths(meta_path));
     }
     if !merged_paths.is_empty() {
@@ -1167,6 +1192,14 @@ fn resolve_trace_backend(arg: TraceBackendArg) -> Result<Option<TraceBackendKind
     }
 }
 
+fn resolve_run_mode(arg: RunModeArg) -> RunMode {
+    match arg {
+        RunModeArg::Host => RunMode::Host,
+        RunModeArg::Bwrap => RunMode::Bwrap,
+        RunModeArg::Chroot => RunMode::Chroot,
+    }
+}
+
 fn log_closure_stats(label: &str, closure: &DependencyClosure) {
     if closure.entry_plans.is_empty() {
         debug!("{label}: no entry plans collected");
@@ -1263,32 +1296,32 @@ fn include_java_runtime(
         return;
     }
     let base = rootfs.join(java_home_path.strip_prefix("/").unwrap_or(java_home_path));
+    let logical_base = Path::new("/").join(java_home_path.strip_prefix("/").unwrap_or(java_home_path));
     let candidates = [
-        base.join("lib/libjava.so"),
-        base.join("lib/server/libjvm.so"),
+        (logical_base.join("lib/libjava.so"), base.join("lib/libjava.so")),
+        (
+            logical_base.join("lib/server/libjvm.so"),
+            base.join("lib/server/libjvm.so"),
+        ),
     ];
-    for candidate in candidates {
-        if !candidate.exists() {
+    for (logical, host_path) in candidates {
+        if !host_path.exists() {
             continue;
         }
-        let destination = payload_path_for(&candidate);
-        if closure
-            .files
-            .iter()
-            .any(|f| f.destination == destination)
-        {
+        let destination = payload_path_for(&logical);
+        if closure.files.iter().any(|f| f.destination == destination) {
             continue;
         }
-        match compute_digest(&candidate) {
+        match compute_digest(&host_path) {
             Ok(digest) => {
                 closure.files.push(ResolvedFile {
-                    source: candidate.clone(),
+                    source: host_path.clone(),
                     destination,
                     digest,
                 });
                 debug!(
                     "java runtime: added {} from JAVA_HOME {} for origin {:?}",
-                    candidate.display(),
+                    host_path.display(),
                     java_home,
                     origin
                 );
@@ -1296,7 +1329,7 @@ fn include_java_runtime(
             Err(err) => {
                 warn!(
                     "java runtime: failed to hash {}: {err}",
-                    candidate.display()
+                    host_path.display()
                 );
             }
         }
@@ -1433,11 +1466,9 @@ fn describe_status(status: &EntryValidationStatus) -> String {
             LinkerFailure::InvalidPath { path } => {
                 format!("invalid path {}", path.display())
             }
-            LinkerFailure::UnsupportedStub { linker, message } => format!(
-                "linker {} unsupported stub: {}",
-                linker.display(),
-                message
-            ),
+            LinkerFailure::UnsupportedStub { linker, message } => {
+                format!("linker {} unsupported stub: {}", linker.display(), message)
+            }
             LinkerFailure::Other { message } => message.clone(),
         },
     }

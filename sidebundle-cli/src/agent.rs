@@ -5,16 +5,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::TraceBackendArg;
 use anyhow::{bail, Context, Result};
 use log::{debug, info};
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
-use std::fmt;
 use sidebundle_closure::{
     image::ImageConfig,
     trace::{AgentTraceCommand, TraceSpec, TraceSpecReport},
 };
-use crate::TraceBackendArg;
+use std::fmt;
 use tempfile::TempDir;
 
 use crate::{BackendPreference, ImageEntryArg};

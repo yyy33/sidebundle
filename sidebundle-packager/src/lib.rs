@@ -72,6 +72,11 @@ impl Packager {
             path: data_dir.clone(),
             source,
         })?;
+        // ensure payload has /data so runtime bind of bundle_root/data -> /data succeeds
+        fs::create_dir_all(bundle_root.join("payload/data")).map_err(|source| PackagerError::Io {
+            path: bundle_root.join("payload/data"),
+            source,
+        })?;
 
         let mut manifest_files = Vec::new();
         let mut alias_map: HashMap<PathBuf, Vec<PathBuf>> = closure.runtime_aliases.clone();
@@ -99,29 +104,53 @@ impl Packager {
         let traced_queue: Vec<TracedFile> = closure.traced_files.clone();
 
         for file in &closure.files {
-            if !file.source.exists() {
+            let mut source_path = file.source.clone();
+            let mut digest = file.digest.clone();
+
+            // If resolv.conf is empty in the image/rootfs, fall back to host copy to avoid empty placeholder.
+            if is_empty_resolv_conf(&source_path, &file.destination) {
+                if let Some(host_resolv) = fallback_host_resolv_conf() {
+                    debug!(
+                        "packager: replacing empty resolv.conf {} with host {}",
+                        source_path.display(),
+                        host_resolv.display()
+                    );
+                    source_path = host_resolv;
+                    digest = compute_digest(&source_path)?;
+                } else {
+                    warn!(
+                        "packager: empty resolv.conf at {}; host fallback missing, keeping empty file",
+                        source_path.display()
+                    );
+                }
+            }
+
+            if !source_path.exists() {
                 warn!(
                     "packager: source file {} missing; bundle path {}",
-                    file.source.display(),
+                    source_path.display(),
                     file.destination.display()
                 );
             } else {
                 debug!(
                     "packager: staging {} -> {}",
-                    file.source.display(),
+                    source_path.display(),
                     file.destination.display()
                 );
             }
-            let stored = store_in_data(&data_dir, &file.source, &file.digest)?;
+            let stored = store_in_data(&data_dir, &source_path, &digest)?;
 
             let dest_path = bundle_root.join(&file.destination);
-            let force_copy = script_targets.contains(&file.destination);
+            let mut force_copy = script_targets.contains(&file.destination);
+            if is_system_resolv_or_hosts(&file.destination) {
+                force_copy = true;
+            }
             link_or_copy(&stored, &dest_path, !force_copy)?;
             manifest_files.push(ManifestFile {
                 origin: FileOrigin::Dependency,
-                source: file.source.display().to_string(),
+                source: source_path.display().to_string(),
                 destination: file.destination.clone(),
-                digest: file.digest.clone(),
+                digest: digest.clone(),
             });
             if let Some(runtime_aliases) = alias_map.remove(&file.source) {
                 let canonical_abs = bundle_root.join(&file.destination);
@@ -299,17 +328,18 @@ fn store_in_data(data_dir: &Path, source: &Path, digest: &str) -> Result<PathBuf
     if stored.exists() {
         return Ok(stored);
     }
+    let source = resolve_symlink(source);
     if let Some(parent) = stored.parent() {
         fs::create_dir_all(parent).map_err(|source| PackagerError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    fs::copy(source, &stored).map_err(|source| PackagerError::Io {
+    fs::copy(&source, &stored).map_err(|source| PackagerError::Io {
         path: stored.clone(),
         source,
     })?;
-    copy_permissions(source, &stored).ok();
+    copy_permissions(&source, &stored).ok();
     Ok(stored)
 }
 
@@ -345,6 +375,24 @@ fn link_or_copy(stored: &Path, dest: &Path, allow_symlink: bool) -> Result<(), P
     })?;
     copy_permissions(stored, dest).ok();
     Ok(())
+}
+
+/// Resolve a symlink source to its target to avoid embedding host symlink structure
+/// (e.g., /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf) inside the bundle.
+fn resolve_symlink(path: &Path) -> PathBuf {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if let Ok(target) = fs::read_link(path) {
+                if target.is_absolute() {
+                    return target;
+                } else if let Some(parent) = path.parent() {
+                    return parent.join(target);
+                }
+            }
+            path.to_path_buf()
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 fn write_bundle_symlink(bundle_root: &Path, link: &ResolvedSymlink) -> Result<(), PackagerError> {
@@ -422,16 +470,66 @@ fn copy_permissions(src: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn is_empty_resolv_conf(source: &Path, destination: &Path) -> bool {
+    let dest_is_resolv = is_system_resolv(destination);
+    if !dest_is_resolv {
+        return false;
+    }
+    match fs::metadata(source) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => false,
+    }
+}
+
+fn fallback_host_resolv_conf() -> Option<PathBuf> {
+    let host = PathBuf::from("/etc/resolv.conf");
+    match fs::metadata(&host) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Some(host),
+        _ => None,
+    }
+}
+
+fn is_system_resolv_or_hosts(path: &Path) -> bool {
+    is_system_resolv(path) || is_system_hosts(path)
+}
+
+fn is_system_resolv(path: &Path) -> bool {
+    tail_matches(path, &["resolv.conf", "etc", "payload"])
+}
+
+fn is_system_hosts(path: &Path) -> bool {
+    tail_matches(path, &["hosts", "etc", "payload"])
+}
+
+fn tail_matches(path: &Path, segments: &[&str]) -> bool {
+    let parts: Vec<String> = path
+        .components()
+        .rev()
+        .take(segments.len())
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if parts.len() != segments.len() {
+        return false;
+    }
+    for (got, expect) in parts.iter().zip(segments.iter()) {
+        if got != expect {
+            return false;
+        }
+    }
+    true
+}
+
 fn compute_digest(path: &Path) -> Result<String, PackagerError> {
-    let mut file = File::open(path).map_err(|source| PackagerError::Io {
-        path: path.to_path_buf(),
+    let real = resolve_symlink(path);
+    let mut file = File::open(&real).map_err(|source| PackagerError::Io {
+        path: real.clone(),
         source,
     })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
     loop {
         let read = file.read(&mut buffer).map_err(|source| PackagerError::Io {
-            path: path.to_path_buf(),
+            path: real.clone(),
             source,
         })?;
         if read == 0 {
@@ -516,6 +614,18 @@ fn ensure_device_nodes(bundle_root: &Path) -> Result<(), PackagerError> {
             rel_path: "payload/dev/tty",
             major: 5,
             minor: 0,
+            mode: 0o666,
+        },
+        DeviceNodeSpec {
+            rel_path: "payload/dev/zero",
+            major: 1,
+            minor: 5,
+            mode: 0o666,
+        },
+        DeviceNodeSpec {
+            rel_path: "payload/dev/urandom",
+            major: 1,
+            minor: 9,
             mode: 0o666,
         },
     ];
