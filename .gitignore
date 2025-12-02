@@ -10,6 +10,8 @@ openspec/
 AGENTS.md
 CLAUDE.md
 *.swp
+event-tag.json
+.secrets
 
 # Tooling caches
 /.cargo/
