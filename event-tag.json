@@ -1,0 +1,5 @@
+{
+  "ref": "refs/tags/v0.2.2",
+  "repository": { "full_name": "your/repo" },
+  "head_commit": { "id": "a9bafafebacf60fd79760e613f1a388ef0ef9956" }
+}
