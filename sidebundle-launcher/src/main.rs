@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use sidebundle_core::{RuntimeMetadata, RunMode};
+use sidebundle_core::{RunMode, RuntimeMetadata};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsStr};
@@ -43,7 +43,6 @@ fn run() -> Result<()> {
             metadata,
             run_mode,
         } => {
-            let run_mode = run_mode;
             let payload_root = bundle_root.join("payload");
             let entry_host = bundle_root.join(&binary);
             let entry_mapped = map_bundle_path(bundle_root, &binary, run_mode);
@@ -105,7 +104,6 @@ fn run() -> Result<()> {
             metadata,
             run_mode,
         } => {
-            let run_mode = run_mode;
             let payload_root = bundle_root.join("payload");
             let interpreter_host = bundle_root.join(&interpreter);
             let interpreter_mapped = map_bundle_path(bundle_root, &interpreter, run_mode);
@@ -275,9 +273,15 @@ fn build_env_block(
             .get("PATH")
             .cloned()
             .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+            .unwrap_or_else(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+            });
         env_map.insert("PATH".into(), default_path.clone());
-        mapped_path_entries = default_path.split(':').filter(|p| !p.is_empty()).map(|s| s.to_string()).collect();
+        mapped_path_entries = default_path
+            .split(':')
+            .filter(|p| !p.is_empty())
+            .map(|s| s.to_string())
+            .collect();
     }
 
     if !library_paths.is_empty() {
@@ -472,13 +476,15 @@ fn exec_bwrap(
     argv: &[CString],
     envp: &[CString],
 ) -> Result<()> {
-    let bwrap_bin = find_bwrap().context("bubblewrap (bwrap) not found in PATH; required for run_mode=bwrap")?;
+    let bwrap_bin = find_bwrap()
+        .context("bubblewrap (bwrap) not found in PATH; required for run_mode=bwrap")?;
 
-    let mut args: Vec<CString> = Vec::new();
-    args.push(os_to_cstring(bwrap_bin.as_os_str())?);
-    args.push(CString::new("--bind")?);
-    args.push(CString::new(payload_root.to_string_lossy().to_string())?);
-    args.push(CString::new("/")?);
+    let mut args: Vec<CString> = vec![
+        os_to_cstring(bwrap_bin.as_os_str())?,
+        CString::new("--bind")?,
+        CString::new(payload_root.to_string_lossy().to_string())?,
+        CString::new("/")?,
+    ];
     let data_root = bundle_root.join("data");
     if data_root.exists() {
         // ensure target mountpoint exists under new root (/data)
@@ -556,7 +562,7 @@ fn exec_chroot(
             return Err(std::io::Error::last_os_error())
                 .with_context(|| "chroot failed for launcher");
         }
-        if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) != 0 {
+        if libc::chdir(c"/".as_ptr() as *const libc::c_char) != 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| "chdir after chroot failed");
         }

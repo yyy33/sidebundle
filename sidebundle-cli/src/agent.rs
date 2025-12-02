@@ -454,7 +454,7 @@ fn build_agent_trace_spec(entries: &[ImageEntryArg], config: &ImageConfig) -> Tr
         }
         spec.commands.push(AgentTraceCommand {
             argv,
-            cwd: config.workdir.as_ref().map(|p| p.clone()),
+            cwd: config.workdir.clone(),
         });
     }
     spec

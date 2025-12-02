@@ -14,7 +14,6 @@ use env_logger::Env;
 use log::{debug, info, warn, LevelFilter};
 use pathdiff::diff_paths;
 use sha2::{Digest, Sha256};
-use shell_words;
 use sidebundle_closure::{
     image::{DockerProvider, ImageRoot, ImageRootProvider, PodmanProvider},
     trace::{
@@ -67,26 +66,26 @@ fn execute_create(args: CreateArgs) -> Result<()> {
         name,
         target,
         out_dir,
-    trace_root,
-    trace_backend,
-    image_trace_backend,
-    image_agent_bin,
-    image_agent_cli,
-    image_agent_keep_output,
-    image_agent_keep_rootfs,
-    copy_dir,
-    allow_gpu_libs,
-    strict_validate,
-    set_env,
-    run_mode,
-} = args;
+        trace_root,
+        trace_backend,
+        image_trace_backend,
+        image_agent_bin,
+        image_agent_cli,
+        image_agent_keep_output,
+        image_agent_keep_rootfs,
+        copy_dir,
+        allow_gpu_libs,
+        strict_validate,
+        set_env,
+        run_mode,
+    } = args;
 
     if from_host.is_empty() && from_image.is_empty() && copy_dir.is_empty() {
         bail!("at least one --from-host, --from-image or --copy-dir entry is required");
     }
 
     let target = TargetTriple::parse(&target)
-        .with_context(|| format!("unsupported target triple: {}", target))?;
+        .with_context(|| format!("unsupported target triple: {target}"))?;
 
     info!(
         "building bundle `{}` for target {} ({} host entries, {} image entries)",
@@ -167,16 +166,16 @@ fn execute_create(args: CreateArgs) -> Result<()> {
             entries.len(),
             if entries.len() == 1 { "y" } else { "ies" }
         );
-        let image_result = build_image_closure(
+        let image_result = build_image_closure(BuildImageArgs {
             preference,
-            &reference,
-            &entries,
+            reference: &reference,
+            entries: &entries,
             target,
-            image_backend_choice,
-            agent_launch.as_ref(),
+            trace_backend: image_backend_choice,
+            agent_launch: agent_launch.as_ref(),
             allow_gpu_libs,
-            run_mode_resolved,
-        )
+            run_mode: run_mode_resolved,
+        })
         .with_context(|| {
             format!("failed to build closure for image `{reference}` using backend {preference:?}")
         })?;
@@ -780,9 +779,9 @@ fn add_copy_dirs(
                         }
                         BackendPreference::Podman => Box::new(PodmanProvider::new()),
                     };
-                    let image_root = provider.prepare_root(reference).with_context(|| {
-                        format!("failed to prepare image root for {}", reference)
-                    })?;
+                    let image_root = provider
+                        .prepare_root(reference)
+                        .with_context(|| format!("failed to prepare image root for {reference}"))?;
                     let (_r, rootfs_path, _config) = image_root.into_parts();
                     physical_image_path(&rootfs_path, path)
                 };
@@ -822,16 +821,13 @@ fn copy_dir_into_closure(
             );
             continue;
         }
-        let rel = dirent
-            .path()
-            .strip_prefix(source)
-            .with_context(|| {
-                format!(
-                    "failed to strip {} prefix from {}",
-                    source.display(),
-                    dirent.path().display()
-                )
-            })?;
+        let rel = dirent.path().strip_prefix(source).with_context(|| {
+            format!(
+                "failed to strip {} prefix from {}",
+                source.display(),
+                dirent.path().display()
+            )
+        })?;
         let mut dest = PathBuf::from("payload");
         if dest_root.is_absolute() {
             for comp in dest_root.components().skip(1) {
@@ -909,16 +905,65 @@ const SYSTEM_ASSET_PATHS: &[&str] = &[
     "/etc/hosts",
 ];
 
-fn build_image_closure(
+struct BuildImageArgs<'a> {
     preference: BackendPreference,
-    reference: &str,
-    entries: &[ImageEntryArg],
+    reference: &'a str,
+    entries: &'a [ImageEntryArg],
     target: TargetTriple,
     trace_backend: TraceBackendArg,
-    agent_launch: Option<&AgentLaunchConfig>,
+    agent_launch: Option<&'a AgentLaunchConfig>,
     allow_gpu_libs: bool,
     run_mode: RunMode,
-) -> Result<ImageClosureResult> {
+}
+
+struct BuildWithBackendArgs<'a> {
+    backend: BackendPreference,
+    reference: &'a str,
+    entries: &'a [ImageEntryArg],
+    target: TargetTriple,
+    trace_backend: TraceBackendArg,
+    agent_launch: Option<&'a AgentLaunchConfig>,
+    allow_gpu_libs: bool,
+    run_mode: RunMode,
+}
+
+struct BuildAgentImageArgs<'a> {
+    backend: BackendPreference,
+    reference: &'a str,
+    entries: &'a [ImageEntryArg],
+    target: TargetTriple,
+    launch: &'a AgentLaunchConfig,
+    trace_backend: TraceBackendArg,
+    allow_gpu_libs: bool,
+    run_mode: RunMode,
+}
+
+struct BuildFromRootArgs<'a> {
+    backend: BackendPreference,
+    backend_name: &'static str,
+    reference: &'a str,
+    target: TargetTriple,
+    root: &'a ImageRoot,
+    entries: &'a [ImageEntryArg],
+    trace_backend: TraceBackendArg,
+    agent_launch: Option<&'a AgentLaunchConfig>,
+    allow_gpu_libs: bool,
+    run_mode: RunMode,
+    external_traces: Option<Vec<PathBuf>>,
+    metadata: Option<RuntimeMetadata>,
+}
+
+fn build_image_closure(args: BuildImageArgs) -> Result<ImageClosureResult> {
+    let BuildImageArgs {
+        preference,
+        reference,
+        entries,
+        target,
+        trace_backend,
+        agent_launch,
+        allow_gpu_libs,
+        run_mode,
+    } = args;
     if entries.is_empty() {
         bail!("no entry paths provided for image `{reference}`");
     }
@@ -934,7 +979,7 @@ fn build_image_closure(
         };
         let mut errors = Vec::new();
         for backend in attempts {
-            match build_agent_image_closure(
+            match build_agent_image_closure(BuildAgentImageArgs {
                 backend,
                 reference,
                 entries,
@@ -943,7 +988,7 @@ fn build_image_closure(
                 trace_backend,
                 allow_gpu_libs,
                 run_mode,
-            ) {
+            }) {
                 Ok(result) => return Ok(result),
                 Err(err) => errors.push(format!("{backend:?}: {err:?}")),
             }
@@ -960,7 +1005,7 @@ fn build_image_closure(
     };
     let mut errors = Vec::new();
     for backend in attempts {
-        match build_with_backend(
+        match build_with_backend(BuildWithBackendArgs {
             backend,
             reference,
             entries,
@@ -969,7 +1014,7 @@ fn build_image_closure(
             agent_launch,
             allow_gpu_libs,
             run_mode,
-        ) {
+        }) {
             Ok(result) => return Ok(result),
             Err(err) => errors.push(format!("{backend:?}: {err:?}")),
         }
@@ -980,70 +1025,72 @@ fn build_image_closure(
     );
 }
 
-fn build_with_backend(
-    backend: BackendPreference,
-    reference: &str,
-    entries: &[ImageEntryArg],
-    target: TargetTriple,
-    trace_backend: TraceBackendArg,
-    agent_launch: Option<&AgentLaunchConfig>,
-    allow_gpu_libs: bool,
-    run_mode: RunMode,
-) -> Result<ImageClosureResult> {
+fn build_with_backend(args: BuildWithBackendArgs) -> Result<ImageClosureResult> {
+    let BuildWithBackendArgs {
+        backend,
+        reference,
+        entries,
+        target,
+        trace_backend,
+        agent_launch,
+        allow_gpu_libs,
+        run_mode,
+    } = args;
     match backend {
         BackendPreference::Docker => {
             let provider = DockerProvider::new();
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "docker provider invocation failed")?;
-            build_closure_from_root(
+            build_closure_from_root(BuildFromRootArgs {
                 backend,
-                "docker",
+                backend_name: "docker",
                 reference,
                 target,
-                &root,
+                root: &root,
                 entries,
                 trace_backend,
                 agent_launch,
                 allow_gpu_libs,
                 run_mode,
-                None,
-                None,
-            )
+                external_traces: None,
+                metadata: None,
+            })
         }
         BackendPreference::Podman | BackendPreference::Auto => {
             let provider = PodmanProvider::new();
             let root = provider
                 .prepare_root(reference)
                 .with_context(|| "podman provider invocation failed")?;
-            build_closure_from_root(
+            build_closure_from_root(BuildFromRootArgs {
                 backend,
-                "podman",
+                backend_name: "podman",
                 reference,
                 target,
-                &root,
+                root: &root,
                 entries,
                 trace_backend,
                 agent_launch,
                 allow_gpu_libs,
                 run_mode,
-                None,
-                None,
-            )
+                external_traces: None,
+                metadata: None,
+            })
         }
     }
 }
 
-fn build_agent_image_closure(
-    backend: BackendPreference,
-    reference: &str,
-    entries: &[ImageEntryArg],
-    target: TargetTriple,
-    launch: &AgentLaunchConfig,
-    trace_backend: TraceBackendArg,
-    allow_gpu_libs: bool,
-    run_mode: RunMode,
-) -> Result<ImageClosureResult> {
+fn build_agent_image_closure(args: BuildAgentImageArgs) -> Result<ImageClosureResult> {
+    let BuildAgentImageArgs {
+        backend,
+        reference,
+        entries,
+        target,
+        launch,
+        trace_backend,
+        allow_gpu_libs,
+        run_mode,
+    } = args;
     let backend_name = match backend {
         BackendPreference::Docker => "docker",
         BackendPreference::Podman => "podman",
@@ -1055,10 +1102,7 @@ fn build_agent_image_closure(
         launch.keep_output,
         launch.keep_rootfs,
     )?;
-    debug!(
-        "agent: launching container backed by {:?} for `{}`",
-        backend, reference
-    );
+    debug!("agent: launching container backed by {backend:?} for `{reference}`");
     let run_result = runner.run(reference, entries, trace_backend)?;
     let AgentRunResult {
         report,
@@ -1093,41 +1137,41 @@ fn build_agent_image_closure(
         }
     }
     let (export_path, cleanup_guard) = rootfs.into_parts();
-    let config = config;
     let mut image_root = ImageRoot::new(reference, export_path, config);
     if let Some(guard) = cleanup_guard {
         image_root = image_root.with_cleanup(move || drop(guard));
     }
-    build_closure_from_root(
+    build_closure_from_root(BuildFromRootArgs {
         backend,
         backend_name,
         reference,
         target,
-        &image_root,
+        root: &image_root,
         entries,
-        TraceBackendArg::Off,
-        None,
+        trace_backend: TraceBackendArg::Off,
+        agent_launch: None,
         allow_gpu_libs,
         run_mode,
-        Some(trace_files),
+        external_traces: Some(trace_files),
         metadata,
-    )
+    })
 }
 
-fn build_closure_from_root(
-    backend: BackendPreference,
-    backend_name: &'static str,
-    reference: &str,
-    target: TargetTriple,
-    root: &ImageRoot,
-    entries: &[ImageEntryArg],
-    trace_backend: TraceBackendArg,
-    agent_launch: Option<&AgentLaunchConfig>,
-    allow_gpu_libs: bool,
-    run_mode: RunMode,
-    external_traces: Option<Vec<PathBuf>>,
-    metadata: Option<RuntimeMetadata>,
-) -> Result<ImageClosureResult> {
+fn build_closure_from_root(args: BuildFromRootArgs) -> Result<ImageClosureResult> {
+    let BuildFromRootArgs {
+        backend,
+        backend_name,
+        reference,
+        target,
+        root,
+        entries,
+        trace_backend,
+        agent_launch,
+        allow_gpu_libs,
+        run_mode,
+        external_traces,
+        metadata,
+    } = args;
     let rootfs = root.rootfs().to_path_buf();
     ensure_image_library_aliases(&rootfs);
     let image_env = parse_image_env(&root.config().env);
@@ -1497,7 +1541,7 @@ fn apply_env_overrides(closure: &mut DependencyClosure, overrides: &[(String, St
         closure
             .metadata
             .entry(origin.clone())
-            .or_insert_with(RuntimeMetadata::default)
+            .or_default()
             .env
             .extend(overrides.clone());
     }
@@ -1520,9 +1564,13 @@ fn include_java_runtime(
         return;
     }
     let base = rootfs.join(java_home_path.strip_prefix("/").unwrap_or(java_home_path));
-    let logical_base = Path::new("/").join(java_home_path.strip_prefix("/").unwrap_or(java_home_path));
+    let logical_base =
+        Path::new("/").join(java_home_path.strip_prefix("/").unwrap_or(java_home_path));
     let candidates = [
-        (logical_base.join("lib/libjava.so"), base.join("lib/libjava.so")),
+        (
+            logical_base.join("lib/libjava.so"),
+            base.join("lib/libjava.so"),
+        ),
         (
             logical_base.join("lib/server/libjvm.so"),
             base.join("lib/server/libjvm.so"),
@@ -1662,7 +1710,7 @@ fn describe_status(status: &EntryValidationStatus) -> String {
     match status {
         EntryValidationStatus::StaticOk => "static entry".to_string(),
         EntryValidationStatus::DynamicOk { resolved } => {
-            format!("dynamic entry (resolved {} libs)", resolved)
+            format!("dynamic entry (resolved {resolved} libs)")
         }
         EntryValidationStatus::LinkerSkipped { reason } => {
             format!("linker validation skipped ({reason})")
@@ -1672,7 +1720,7 @@ fn describe_status(status: &EntryValidationStatus) -> String {
         EntryValidationStatus::MissingLinker => "linker missing".to_string(),
         EntryValidationStatus::LinkerError { error } => match error {
             LinkerFailure::Spawn { linker, message } => {
-                format!("failed to spawn linker {}: {}", linker.display(), message)
+                format!("failed to spawn linker {}: {message}", linker.display())
             }
             LinkerFailure::CommandFailed {
                 linker,
@@ -1685,13 +1733,13 @@ fn describe_status(status: &EntryValidationStatus) -> String {
                 stderr
             ),
             LinkerFailure::LibraryNotFound { name, raw } => {
-                format!("missing library {} ({})", name, raw)
+                format!("missing library {name} ({raw})")
             }
             LinkerFailure::InvalidPath { path } => {
                 format!("invalid path {}", path.display())
             }
             LinkerFailure::UnsupportedStub { linker, message } => {
-                format!("linker {} unsupported stub: {}", linker.display(), message)
+                format!("linker {} unsupported stub: {message}", linker.display())
             }
             LinkerFailure::Other { message } => message.clone(),
         },

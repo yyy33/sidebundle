@@ -12,7 +12,7 @@ pub const TRACE_SPEC_VERSION: u32 = 1;
 pub const TRACE_REPORT_VERSION: u32 = 1;
 
 /// Serializable specification describing commands the agent must trace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceSpec {
     pub schema_version: u32,
     #[serde(default)]
@@ -25,12 +25,7 @@ pub struct TraceSpec {
 
 impl TraceSpec {
     pub fn new() -> Self {
-        Self {
-            schema_version: TRACE_SPEC_VERSION,
-            commands: Vec::new(),
-            env: BTreeMap::new(),
-            limits: TraceLimits::default(),
-        }
+        Self::default()
     }
 
     pub fn with_command(mut self, command: TraceCommand) -> Self {
@@ -131,7 +126,7 @@ pub struct AgentTraceBackend {
 impl AgentTraceBackend {
     pub fn new() -> Self {
         Self {
-            engine: Arc::new(NullAgentEngine::default()),
+            engine: Arc::new(NullAgentEngine),
             limits: TraceLimits::default(),
         }
     }

@@ -35,7 +35,7 @@ fn main() {
     } else if profile != "debug" {
         command.arg("--profile").arg(&profile);
     }
-    if env::var("CARGO_NET_OFFLINE").map_or(false, |v| v == "true") {
+    if env::var("CARGO_NET_OFFLINE").is_ok_and(|v| v == "true") {
         command.arg("--offline");
     }
     let status = command

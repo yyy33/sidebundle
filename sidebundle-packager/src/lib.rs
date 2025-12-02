@@ -73,9 +73,11 @@ impl Packager {
             source,
         })?;
         // ensure payload has /data so runtime bind of bundle_root/data -> /data succeeds
-        fs::create_dir_all(bundle_root.join("payload/data")).map_err(|source| PackagerError::Io {
-            path: bundle_root.join("payload/data"),
-            source,
+        fs::create_dir_all(bundle_root.join("payload/data")).map_err(|source| {
+            PackagerError::Io {
+                path: bundle_root.join("payload/data"),
+                source,
+            }
         })?;
 
         let mut manifest_files = Vec::new();
@@ -540,7 +542,7 @@ fn compute_digest(path: &Path) -> Result<String, PackagerError> {
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        FmtWrite::write_fmt(&mut hex, format_args!("{:02x}", byte)).expect("write digest");
+        FmtWrite::write_fmt(&mut hex, format_args!("{byte:02x}")).expect("write digest");
     }
     Ok(hex)
 }
@@ -667,8 +669,7 @@ fn create_device_node(path: &Path, major: u64, minor: u64, mode: u32) -> io::Res
 
     let dev = makedev(major, minor);
     let mode = Mode::from_bits_truncate(mode);
-    mknod(path, SFlag::S_IFCHR, mode, dev)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+    mknod(path, SFlag::S_IFCHR, mode, dev).map_err(|err| io::Error::other(err.to_string()))
 }
 
 #[cfg(not(unix))]

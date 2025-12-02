@@ -166,10 +166,10 @@ fn format_stub_message(stdout: &str, stderr: &str) -> String {
     }
     let mut parts = Vec::new();
     if !stdout.is_empty() {
-        parts.push(format!("stdout: {}", stdout));
+        parts.push(format!("stdout: {stdout}"));
     }
     if !stderr.is_empty() {
-        parts.push(format!("stderr: {}", stderr));
+        parts.push(format!("stderr: {stderr}"));
     }
     parts.join(" | ")
 }

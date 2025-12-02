@@ -22,18 +22,13 @@ pub enum TargetOs {
 }
 
 /// 运行模式，决定 launcher 如何进入打包环境。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
+    #[default]
     Host,
     Bwrap,
     Chroot,
-}
-
-impl Default for RunMode {
-    fn default() -> Self {
-        RunMode::Host
-    }
 }
 
 /// 目标三元组，用于后续扩展到多平台。

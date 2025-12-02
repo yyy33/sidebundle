@@ -17,7 +17,6 @@ use linker::{is_gcompat_stub_binary, LibraryResolution, LinkerError, LinkerRunne
 use log::debug;
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use shell_words;
 use sidebundle_core::{
     parse_elf_metadata, BinaryEntryPlan, BundleEntry, BundleSpec, DependencyClosure, ElfMetadata,
     ElfParseError, EntryBundlePlan, LogicalPath, Origin, ResolvedFile, ScriptEntryPlan, TracedFile,
@@ -235,6 +234,26 @@ pub struct ResolverSet {
     resolvers: HashMap<Origin, Arc<dyn PathResolver>>,
 }
 
+struct PlanState<'a> {
+    files: &'a mut BTreeMap<PathBuf, PathBuf>,
+    aliases: &'a mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+    cache: &'a mut HashMap<PathBuf, ElfMetadata>,
+}
+
+impl<'a> PlanState<'a> {
+    fn new(
+        files: &'a mut BTreeMap<PathBuf, PathBuf>,
+        aliases: &'a mut HashMap<PathBuf, BTreeSet<PathBuf>>,
+        cache: &'a mut HashMap<PathBuf, ElfMetadata>,
+    ) -> Self {
+        Self {
+            files,
+            aliases,
+            cache,
+        }
+    }
+}
+
 impl ResolverSet {
     pub fn new() -> Self {
         Self::default()
@@ -252,7 +271,7 @@ impl ResolverSet {
 impl Default for ResolverSet {
     fn default() -> Self {
         let mut map: HashMap<Origin, Arc<dyn PathResolver>> = HashMap::new();
-        map.insert(Origin::Host, Arc::new(HostPathResolver::default()));
+        map.insert(Origin::Host, Arc::new(HostPathResolver));
         Self { resolvers: map }
     }
 }
@@ -277,10 +296,7 @@ impl ClosureBuilder {
                 .ok()
                 .map(|value| Self::split_paths(&value))
                 .unwrap_or_default(),
-            default_paths: DEFAULT_LIBRARY_DIRS
-                .iter()
-                .map(|dir| PathBuf::from(dir))
-                .collect(),
+            default_paths: DEFAULT_LIBRARY_DIRS.iter().map(PathBuf::from).collect(),
             origin_paths: HashMap::new(),
             scanned_scripts: RefCell::new(HashSet::new()),
             allow_gpu_libs: false,
@@ -319,7 +335,7 @@ impl ClosureBuilder {
     pub fn with_external_trace_paths(mut self, origin: Origin, paths: Vec<PathBuf>) -> Self {
         self.external_traces
             .entry(origin)
-            .or_insert_with(Vec::new)
+            .or_default()
             .extend(paths);
         self
     }
@@ -508,6 +524,7 @@ impl ClosureBuilder {
         cache: &mut HashMap<PathBuf, ElfMetadata>,
         traced: &[TracedFile],
     ) -> Result<(), ClosureError> {
+        let mut state = PlanState::new(files, aliases, cache);
         let mut promoted: HashSet<PathBuf> = HashSet::new();
         for artifact in traced {
             if !artifact.is_elf {
@@ -521,15 +538,8 @@ impl ClosureBuilder {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("traced-entry");
-            let _ = self.build_entry_plan(
-                resolver,
-                origin,
-                &artifact.resolved,
-                display,
-                files,
-                aliases,
-                cache,
-            )?;
+            let _ =
+                self.build_entry_plan(resolver, origin, &artifact.resolved, display, &mut state)?;
         }
         Ok(())
     }
@@ -566,14 +576,13 @@ impl ClosureBuilder {
         cache: &mut HashMap<PathBuf, ElfMetadata>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         let entry_source = self.canonical_entry_path(resolver, &entry.logical)?;
+        let mut state = PlanState::new(files, aliases, cache);
         self.build_entry_plan(
             resolver,
             entry.logical.origin(),
             &entry_source,
             &entry.display_name,
-            files,
-            aliases,
-            cache,
+            &mut state,
         )
     }
 
@@ -583,24 +592,16 @@ impl ClosureBuilder {
         origin: &Origin,
         entry_source: &Path,
         display_name: &str,
-        files: &mut BTreeMap<PathBuf, PathBuf>,
-        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
-        cache: &mut HashMap<PathBuf, ElfMetadata>,
+        state: &mut PlanState<'_>,
     ) -> Result<EntryBundlePlan, ClosureError> {
         match parse_elf_metadata(entry_source) {
             Ok(metadata) => {
-                cache
+                state
+                    .cache
                     .entry(entry_source.to_path_buf())
                     .or_insert_with(|| metadata.clone());
-                let plan = self.build_binary_plan(
-                    resolver,
-                    origin,
-                    entry_source,
-                    display_name,
-                    files,
-                    aliases,
-                    cache,
-                )?;
+                let plan =
+                    self.build_binary_plan(resolver, origin, entry_source, display_name, state)?;
                 Ok(EntryBundlePlan::Binary(plan))
             }
             Err(ElfParseError::NotElf { .. }) => {
@@ -610,17 +611,15 @@ impl ClosureBuilder {
                     origin,
                     &shebang.interpreter_host,
                     display_name,
-                    files,
-                    aliases,
-                    cache,
+                    state,
                 )?;
                 let runtime_alias = resolver
                     .host_to_logical(entry_source)
                     .map(|logical| logical.path().to_path_buf());
                 let script_destination = ensure_file(
                     resolver,
-                    files,
-                    aliases,
+                    state.files,
+                    state.aliases,
                     entry_source,
                     runtime_alias.as_deref(),
                 );
@@ -639,14 +638,7 @@ impl ClosureBuilder {
                     run_mode: None,
                 };
                 if Self::is_bash_interpreter(&plan.interpreter_source) {
-                    self.collect_bash_dependencies(
-                        resolver,
-                        origin,
-                        entry_source,
-                        files,
-                        aliases,
-                        cache,
-                    );
+                    self.collect_bash_dependencies(resolver, origin, entry_source, state);
                 }
                 Ok(EntryBundlePlan::Script(plan))
             }
@@ -663,18 +655,22 @@ impl ClosureBuilder {
         origin: &Origin,
         entry_source: &Path,
         display_name: &str,
-        files: &mut BTreeMap<PathBuf, PathBuf>,
-        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
-        cache: &mut HashMap<PathBuf, ElfMetadata>,
+        state: &mut PlanState<'_>,
     ) -> Result<BinaryEntryPlan, ClosureError> {
-        let entry_metadata = self.load_metadata(entry_source, cache)?;
-        let entry_dest = ensure_file(resolver, files, aliases, entry_source, None);
+        let entry_metadata = self.load_metadata(entry_source, state.cache)?;
+        let entry_dest = ensure_file(resolver, state.files, state.aliases, entry_source, None);
 
         let (mut interpreter_source, mut interpreter_dest, is_static) =
             match entry_metadata.interpreter.clone() {
                 Some(path) => {
                     let canonical = canonicalize(&path, resolver.trace_root())?;
-                    let dest = ensure_file(resolver, files, aliases, &canonical, Some(&path));
+                    let dest = ensure_file(
+                        resolver,
+                        state.files,
+                        state.aliases,
+                        &canonical,
+                        Some(&path),
+                    );
                     (Some(canonical), Some(dest), false)
                 }
                 None => (None, None, true),
@@ -693,12 +689,12 @@ impl ClosureBuilder {
                 continue;
             }
 
-            let metadata = self.load_metadata(&current, cache)?;
+            let metadata = self.load_metadata(&current, state.cache)?;
             if is_static {
                 continue;
             }
             let interpreter = interpreter_source.as_ref().expect("static skipped");
-            let search_paths = self.compute_search_paths(resolver, origin, &current, &metadata);
+            let search_paths = self.compute_search_paths(resolver, origin, &current, metadata);
             let resolved =
                 self.trace_with_linker(interpreter, &current, &search_paths, metadata)?;
 
@@ -720,8 +716,8 @@ impl ClosureBuilder {
                     .map(|logical| logical.path().to_path_buf());
                 let dest = ensure_file(
                     resolver,
-                    files,
-                    aliases,
+                    state.files,
+                    state.aliases,
                     &canonical,
                     alias_runtime.as_deref(),
                 );
@@ -732,9 +728,9 @@ impl ClosureBuilder {
                     if let Some(logical) = resolver.host_to_logical(&canonical) {
                         let mut runtime_alias = logical.path().to_path_buf();
                         runtime_alias.set_file_name(&resolution.name);
-                        record_alias(aliases, &canonical, &runtime_alias);
+                        record_alias(state.aliases, &canonical, &runtime_alias);
                     } else if alias_path != dest {
-                        record_alias(aliases, &canonical, &alias_path);
+                        record_alias(state.aliases, &canonical, &alias_path);
                     }
                 }
                 queue.push_back(canonical);
@@ -754,7 +750,7 @@ impl ClosureBuilder {
                             host_ld.display()
                         );
                         let stub_source = linker_path.clone();
-                        let desired_dest = files.remove(&stub_source).unwrap_or_else(|| {
+                        let desired_dest = state.files.remove(&stub_source).unwrap_or_else(|| {
                             let mut dest = PathBuf::from("payload");
                             for comp in Path::new("/lib/ld-linux-x86-64.so.2").components().skip(1)
                             {
@@ -768,7 +764,7 @@ impl ClosureBuilder {
                             desired_dest.display(),
                             host_ld.display()
                         );
-                        files.insert(host_ld.clone(), desired_dest.clone());
+                        state.files.insert(host_ld.clone(), desired_dest.clone());
                         interpreter_source = Some(host_ld.clone());
                         interpreter_dest = Some(desired_dest);
                         debug!(
@@ -934,10 +930,7 @@ impl ClosureBuilder {
             .get(origin)
             .cloned()
             .unwrap_or_else(|| self.shebang_path_entries());
-        debug!(
-            "resolving command `{}` in origin {:?} with PATH {:?}",
-            command, origin, search_paths
-        );
+        debug!("resolving command `{command}` in origin {origin:?} with PATH {search_paths:?}");
         for dir in search_paths {
             let joined = dir.join(command);
             if let Some(resolved) = self.resolve_in_origin(resolver, origin, &joined) {
@@ -967,20 +960,12 @@ impl ClosureBuilder {
             .ok()
             .map(|value| Self::split_paths(&value))
             .filter(|paths| !paths.is_empty())
-            .unwrap_or_else(|| {
-                DEFAULT_SHEBANG_PATHS
-                    .iter()
-                    .map(|entry| PathBuf::from(entry))
-                    .collect()
-            })
+            .unwrap_or_else(|| DEFAULT_SHEBANG_PATHS.iter().map(PathBuf::from).collect())
     }
 
     fn is_env_invocation(interpreter: &str) -> bool {
         let path = Path::new(interpreter);
-        match path.file_name().and_then(|n| n.to_str()) {
-            Some("env") => true,
-            _ => false,
-        }
+        matches!(path.file_name().and_then(|n| n.to_str()), Some("env"))
     }
 
     fn load_metadata<'a>(
@@ -1090,9 +1075,7 @@ impl ClosureBuilder {
         resolver: &dyn PathResolver,
         origin: &Origin,
         script: &Path,
-        files: &mut BTreeMap<PathBuf, PathBuf>,
-        aliases: &mut HashMap<PathBuf, BTreeSet<PathBuf>>,
-        cache: &mut HashMap<PathBuf, ElfMetadata>,
+        state: &mut PlanState<'_>,
     ) {
         let commands = Self::scan_bash_commands(script);
         {
@@ -1113,18 +1096,13 @@ impl ClosureBuilder {
                         continue;
                     }
                     debug!(
-                        "bash static scan: resolved command `{}` -> {}",
-                        cmd,
+                        "bash static scan: resolved command `{cmd}` -> {}",
                         resolved.display()
                     );
-                    let _ = self
-                        .build_entry_plan(resolver, origin, &resolved, &cmd, files, aliases, cache);
+                    let _ = self.build_entry_plan(resolver, origin, &resolved, &cmd, state);
                 }
                 None => {
-                    debug!(
-                        "bash static scan: command `{}` not found via PATH for origin {:?}",
-                        cmd, origin
-                    );
+                    debug!("bash static scan: command `{cmd}` not found via PATH for origin {origin:?}");
                 }
             }
         }
@@ -1148,7 +1126,7 @@ impl ClosureBuilder {
         for caps in re_line.captures_iter(&data) {
             if let Some(mat) = caps.get(1) {
                 let token = mat.as_str();
-                if keywords.iter().any(|k| *k == token) {
+                if keywords.contains(&token) {
                     continue;
                 }
                 if seen.insert(token.to_string()) {
@@ -1274,6 +1252,12 @@ impl ClosureBuilder {
                 Some(trace::TraceCommand::new(interpreter_logical).with_args(args))
             }
         }
+    }
+}
+
+impl Default for ClosureBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1403,7 +1387,7 @@ fn compute_digest(path: &Path) -> Result<String, ClosureError> {
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write;
-        write!(&mut hex, "{:02x}", byte).expect("write to string");
+        write!(&mut hex, "{byte:02x}").expect("write to string");
     }
     Ok(hex)
 }

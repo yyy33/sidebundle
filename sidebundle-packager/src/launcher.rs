@@ -123,7 +123,7 @@ fn link_entry(bin_dir: &Path, name: &str) -> Result<(), PackagerError> {
             path: entry_path.clone(),
             source,
         })?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {

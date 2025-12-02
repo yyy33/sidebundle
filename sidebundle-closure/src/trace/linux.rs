@@ -168,7 +168,7 @@ unsafe fn ptrace_child_main(root: Option<&Path>, argv: &[CString], envp: &[CStri
 
     let argv_refs: Vec<&CStr> = argv.iter().map(|c| c.as_c_str()).collect();
     let envp_refs: Vec<&CStr> = envp.iter().map(|c| c.as_c_str()).collect();
-    match execve(&argv_refs[0], &argv_refs, &envp_refs) {
+    match execve(argv_refs[0], &argv_refs, &envp_refs) {
         Ok(_) => unreachable!(),
         Err(err) => {
             eprintln!("sidebundle trace: execve failed: {err:?}");
@@ -190,7 +190,7 @@ unsafe fn fanotify_child_main(root: Option<&Path>, argv: &[CString], envp: &[CSt
 
     let argv_refs: Vec<&CStr> = argv.iter().map(|c| c.as_c_str()).collect();
     let envp_refs: Vec<&CStr> = envp.iter().map(|c| c.as_c_str()).collect();
-    match execve(&argv_refs[0], &argv_refs, &envp_refs) {
+    match execve(argv_refs[0], &argv_refs, &envp_refs) {
         Ok(_) => unreachable!(),
         Err(err) => {
             eprintln!("sidebundle trace: execve failed: {err:?}");
@@ -391,14 +391,10 @@ fn map_trace_exit(exit: TraceExit) -> TraceError {
         TraceExit::PtraceDenied => {
             TraceError::Permission("ptrace not permitted on this system".into())
         }
-        TraceExit::ChrootFailure => TraceError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "failed to chroot into trace root",
-        )),
-        TraceExit::ExecFailure => TraceError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "failed to exec trace command",
-        )),
+        TraceExit::ChrootFailure => {
+            TraceError::Io(io::Error::other("failed to chroot into trace root"))
+        }
+        TraceExit::ExecFailure => TraceError::Io(io::Error::other("failed to exec trace command")),
     }
 }
 

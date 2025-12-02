@@ -198,6 +198,12 @@ impl ValidationError {
     }
 }
 
+impl Default for BundleValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ValidationReport {
     pub entries: Vec<EntryValidation>,

@@ -62,6 +62,12 @@ impl TraceCollector {
     }
 }
 
+impl Default for TraceCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Logical trace command executed by the backend.
 #[derive(Debug, Clone)]
 pub struct TraceCommand {
@@ -154,7 +160,7 @@ impl Default for TraceBackendKind {
     fn default() -> Self {
         #[cfg(target_os = "linux")]
         {
-            return TraceBackendKind::ptrace();
+            TraceBackendKind::ptrace()
         }
         #[cfg(not(target_os = "linux"))]
         {

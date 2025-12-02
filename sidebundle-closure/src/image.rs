@@ -131,7 +131,7 @@ impl ImageRoot {
 
 impl ImageRootInner {
     fn into_parts(mut self) -> (String, PathBuf, ImageConfig) {
-        if let Some(slot) = self.cleanup.get_mut().ok() {
+        if let Ok(slot) = self.cleanup.get_mut() {
             *slot = None;
         }
         (
@@ -257,7 +257,7 @@ impl ImageRootProvider for DockerProvider {
         match runtime.block_on(self.prepare_with_bollard(trimmed)) {
             Ok(root) => Ok(root),
             Err(err) => {
-                warn!("docker bollard path failed ({}), falling back to CLI", err);
+                warn!("docker bollard path failed ({err}), falling back to CLI");
                 self.prepare_with_cli(trimmed)
             }
         }
@@ -370,10 +370,9 @@ impl PodmanProvider {
         let (socket_uri, mut guard) = self.start_service()?;
         let runtime = self.create_runtime()?;
         let result = runtime.block_on(async {
-            let docker = Docker::connect_with_unix(&socket_uri, 120, &API_DEFAULT_VERSION)
-                .map_err(|err| {
-                    ImageProviderError::unavailable("podman-service", err.to_string())
-                })?;
+            let docker = Docker::connect_with_unix(&socket_uri, 120, API_DEFAULT_VERSION).map_err(
+                |err| ImageProviderError::unavailable("podman-service", err.to_string()),
+            )?;
             let docker = docker.negotiate_version().await.map_err(|err| {
                 ImageProviderError::unavailable("podman-service", err.to_string())
             })?;
@@ -477,6 +476,7 @@ impl PodmanContainerGuard {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn into_mount_cleanup(&mut self) -> PodmanMountCleanup {
         self.active = false;
         PodmanMountCleanup {
