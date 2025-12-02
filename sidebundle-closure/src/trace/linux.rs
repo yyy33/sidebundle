@@ -329,6 +329,7 @@ fn record_fanotify_event(event: &nix::sys::fanotify::FanotifyEvent, report: &mut
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn handle_syscall(pid: Pid, report: &mut TraceReport) -> Result<(), TraceError> {
     let regs = ptrace::getregs(pid).map_err(TraceError::Nix)?;
     let syscall = regs.orig_rax as i64;
@@ -349,6 +350,13 @@ fn handle_syscall(pid: Pid, report: &mut TraceReport) -> Result<(), TraceError> 
         report.record_path(PathBuf::from(path));
     }
     Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn handle_syscall(_pid: Pid, _report: &mut TraceReport) -> Result<(), TraceError> {
+    Err(TraceError::Unsupported(
+        "ptrace backend is not supported on this architecture",
+    ))
 }
 
 fn read_string(pid: Pid, addr: usize) -> Result<String, TraceError> {
