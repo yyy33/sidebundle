@@ -71,7 +71,7 @@ jobs:
           target: ${{ matrix.target }}
 
       # Install zig for cross-compilation (works as linker for musl targets)
-      - uses: mkdirp/setup-zig@v1
+      - uses: goto-bus-stop/setup-zig@v2
         with:
           version: '0.11.0'
 
