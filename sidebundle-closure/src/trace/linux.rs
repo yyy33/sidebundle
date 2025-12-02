@@ -13,7 +13,9 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_arch = "x86_64")]
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -359,6 +361,7 @@ fn handle_syscall(_pid: Pid, _report: &mut TraceReport) -> Result<(), TraceError
     ))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn read_string(pid: Pid, addr: usize) -> Result<String, TraceError> {
     let mut bytes = Vec::new();
     let mut offset = 0usize;
