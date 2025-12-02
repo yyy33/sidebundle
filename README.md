@@ -101,7 +101,6 @@ RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc" \
 3. **CI testing**:
    - Should create pull requests (PRs) from feature branches; CI runs on PRs to ensure changes pass lint and test checks
    - All changes should be reviewed before merging to maintain code quality
-4. **Release process**: Create a git tag (e.g., `v0.2.0`) to trigger automated builds and GitHub release creation
 
 The CLI exposes contextual help:
 

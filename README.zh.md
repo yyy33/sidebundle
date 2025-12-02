@@ -94,7 +94,6 @@ RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc" \
 3. **CI 测试**：
    - 应从功能分支创建拉取请求 (PR)；CI 会在 PR 上运行以确保更改通过 lint 和测试检查
    - 所有更改在合并前应经过评审以保持代码质量
-4. **发布流程**：创建 git tag（例如 `v0.2.0`）以触发自动构建和 GitHub release 创建
 
 CLI 提供上下文帮助：
 
