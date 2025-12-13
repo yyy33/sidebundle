@@ -238,9 +238,11 @@ impl Packager {
                         used_hardlink = true;
                         alias_hardlink_count = alias_hardlink_count.saturating_add(1);
                     } else {
-                        fs::copy(&canonical_abs, &alias_abs).map_err(|source| PackagerError::Io {
-                            path: alias_abs.clone(),
-                            source,
+                        fs::copy(&canonical_abs, &alias_abs).map_err(|source| {
+                            PackagerError::Io {
+                                path: alias_abs.clone(),
+                                source,
+                            }
                         })?;
                         copy_permissions(&canonical_abs, &alias_abs).ok();
                         alias_copy_count = alias_copy_count.saturating_add(1);
